@@ -1,0 +1,30 @@
+diff --git a/tags/system-isx86_64/overlays.nix b/tags/system-isx86_64/overlays.nix
+index 1d19186..a3dc03d 100644
+--- a/tags/system-isx86_64/overlays.nix
++++ b/tags/system-isx86_64/overlays.nix
+@@ -6,11 +6,24 @@
+ 
+ [
+ 
+-(final: prev: infuse prev ({
++(final: prev:
++let
++  # The extra config below uses the "y"/"n"/"m" strings understood by
++  # sixos's own kernel expression (mkHost/kernel.nix).  If the host chose a
++  # stock nixpkgs kernel instead (e.g. `pkgs.linuxPackages.kernel`, which is
++  # prebuilt in the binary cache), leave that kernel untouched: overriding
++  # its config would force a rebuild and the string values would not
++  # type-check there anyway.  `enableDistCC` is an argument that only the
++  # sixos kernel expression takes.
++  is-sixos-kernel =
++    (lib.functionArgs (prev.boot.kernel.package.override or (_: null))) ? enableDistCC;
++in infuse prev ([{
+ 
+   boot.kernel.payload.__assign = "${final.boot.kernel.package}/bzImage";
+   boot.kernel.image.__assign   = "${final.boot.kernel.package}/vmlinux";
+ 
++}] ++ lib.optional is-sixos-kernel {
++
+   boot.kernel.package.__input.structuredExtraConfig = lib.mapAttrs (_: v: { __assign = v; }) {
+     X86_X32_ABI = "y";
+     #X86_AMD_PSTATE = "y";

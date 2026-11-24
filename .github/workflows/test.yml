@@ -1,0 +1,59 @@
+name: Test
+
+# Builds the laptop configuration, installs the test configuration onto a
+# virtual disk with installer/sixos-install.sh, boots it in QEMU and checks
+# it (see tests/default.nix).  Runs on every push and pull request, so any
+# change to the instructions, the configuration or the pins is tested.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vm-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-nix
+
+      - name: Build the laptop configuration and run the VM test
+        run: nix-build tests -A all -o result-tests
+
+      - name: Save the serial log and screenshots
+        if: always()
+        run: |
+          mkdir -p test-output
+          # on success the outputs are in the result; on failure, rerunning
+          # the boot test with --keep-failed is not possible here, so the
+          # Nix build log (above) is the record
+          cp -L result-tests/boot/* test-output/ 2>/dev/null || true
+          ls -l test-output
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vm-test-output
+          path: test-output/
+          if-no-files-found: ignore
+
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the links in the instructions
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --exclude-loopback --exclude '^https://search\.nixos\.org' --exclude '^https://github\.com/MaezrFulldive/' README.md
+          fail: true
+
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck installer/sixos-install.sh
+        run: shellcheck --shell=bash installer/sixos-install.sh

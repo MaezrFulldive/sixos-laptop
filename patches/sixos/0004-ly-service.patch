@@ -1,0 +1,123 @@
+diff --git a/by-name/ly/ly-dm/service.nix b/by-name/ly/ly-dm/service.nix
+new file mode 100644
+index 0000000..abb17e2
+--- /dev/null
++++ b/by-name/ly/ly-dm/service.nix
+@@ -0,0 +1,117 @@
++#
++# ly: a TUI display manager (login screen).  https://codeberg.org/fairyglade/ly
++#
++# (The service is called `ly-dm` because a service called `ly` would collide
++# with the two-letter by-name directory `ly/`.)
++#
++# Requirements outside this service:
++#
++# - A PAM service file /etc/pam.d/${service_name} (default: /etc/pam.d/ly).
++#   ly authenticates *only* through PAM.  Its pam_*.so paths should come from
++#   the same nixpkgs as `package`.
++#
++# - /run/user/<uid> must exist for each user who logs in.  ly sets
++#   XDG_RUNTIME_DIR=/run/user/<uid> but (unlike logind) does not create it.
++#
++# - A seat for the graphical session, e.g. `services.seatd`.
++#
++# Note: ly is the parent of every session it starts.  If this service is
++# restarted (which `activate`/`deploy` does when its run script, and hence
++# the generated config.ini, changes) all graphical sessions are killed.
++#
++{ lib
++, pkgs
++, six
++, targets
++
++, package ? pkgs.ly
++
++# virtual terminal number on which ly runs (and which it switches to)
++, tty ? 1
++
++# Extra settings for /etc/ly/config.ini, merged over the defaults below.
++# See ${package}/etc/config.ini for the full list.  Nix `null` is written as
++# ly's `null`.
++, settings ? {}
++
++# additional targets which must be up before ly starts (e.g. seatd)
++, after ? []
++
++# user name preselected on the very first start, before ly has remembered
++# anyone (ly's login field is a list you cycle with Left/Right, not a text
++# field, and it would otherwise start on an arbitrary account)
++, default-user ? null
++}:
++
++let
++  defaults = {
++    service_name = "ly";
++
++    # /run/six/bin comes first so that the setuid-root `doas` is found
++    path = "/run/six/bin:/run/current-system/sw/bin";
++
++    setup_cmd = "${package}/etc/setup.sh";
++    start_cmd = null;
++
++    # Session .desktop files are picked up from everything in the
++    # configuration's `sw` (e.g. share/wayland-sessions/mango.desktop).
++    waylandsessions = "/run/current-system/sw/share/wayland-sessions";
++    xsessions = "/run/current-system/sw/share/xsessions";
++
++    # s6-linux-init's own halt/poweroff/reboot commands
++    shutdown_cmd = "/run/init/bin/poweroff";
++    restart_cmd = "/run/init/bin/reboot";
++
++    allow_empty_password = false;
++
++    # ly lists the users whose uid is between UID_MIN and UID_MAX of
++    # login.defs.  sixos has no /etc/login.defs, and its daemon users
++    # (_sshd, _dnscache, ...) have uids 60000-64999, so give ly one that
++    # matches the sixos uid policy (see mkHost/users.nix).
++    login_defs_path = pkgs.writeText "ly-login.defs" ''
++      UID_MIN 1000
++      UID_MAX 59999
++    '';
++
++    # remember the last user and session in /etc/ly/save.txt
++    save = true;
++  };
++
++  config-ini = pkgs.writeText "ly-config.ini"
++    (lib.generators.toKeyValue {
++      mkKeyValue = lib.generators.mkKeyValueDefault { } " = ";
++    } (defaults // settings));
++
++  busybox = "${pkgs.busybox}/bin/busybox";
++in
++six.mkFunnel {
++  run = pkgs.writeScript "ly-run" (''
++    #!${pkgs.runtimeShell}
++    # ly only reads its configuration from /etc/ly/config.ini
++    ${busybox} mkdir -p /etc/ly/custom-sessions
++    ${busybox} ln -sfn ${config-ini} /etc/ly/config.ini
++  '' + lib.optionalString (default-user != null) ''
++    # ly's save file: the index of the last user, then "user:session" lines
++    [ -e /etc/ly/save.txt ] || printf '0\n%s:0\n' ${lib.escapeShellArg default-user} > /etc/ly/save.txt
++  '' + ''
++
++    # ly draws on the *active* virtual terminal, so make ours the active one,
++    # and make it our controlling terminal (s6-supervise has already made us a
++    # session leader).
++    ${busybox} chvt ${toString tty}
++    exec </dev/tty${toString tty} >/dev/tty${toString tty} 2>&1
++
++    # s6 starts services with an empty environment; without TERM, ly panics
++    # ("reached unreachable code") right after setting up the terminal.
++    export TERM=linux
++    exec ${package}/bin/ly
++  '');
++
++  passthru = {
++    after = [
++      targets.global.coldplug
++      targets.mounts.""          # /etc and /var/log must be writable
++    ] ++ after;
++    inherit config-ini;
++  };
++}

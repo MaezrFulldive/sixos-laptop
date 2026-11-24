@@ -1,0 +1,29 @@
+diff --git a/mkConfiguration/s6-linux-init.nix b/mkConfiguration/s6-linux-init.nix
+index 7e10abe..808d7d1 100644
+--- a/mkConfiguration/s6-linux-init.nix
++++ b/mkConfiguration/s6-linux-init.nix
+@@ -97,8 +97,12 @@ let
+     '';
+ 
+     # This script is called in order to shut down the machine.
+-    # FIXME: call s6-linux-init-umountall here
+-    # FIXME: sigkill-all?
++    #
++    # It only needs to stop the services.  After it exits,
++    # s6-linux-init-shutdownd kills the remaining processes, unmounts the
++    # filesystems and then halts, powers off or reboots, whichever was asked
++    # for.  (This script used to end with a forced `reboot -f`, which turned
++    # every poweroff into a reboot.)
+     "rc.shutdown" = writeScript "rc.shutdown" ''
+       #!${runtimeShell}
+       # Normally logs go to the catch-all logger instead of /dev/console.  Once
+@@ -107,9 +111,6 @@ let
+       exec >/dev/console 2>&1
+       ${s6-rc}/bin/s6-rc -v2 -bDa change
+       ${coreutils}/bin/sync
+-      ${pkgs.busybox}/bin/reboot -d 3 -f   # FIXME: distinguish between reboot and shutdown!
+-      sleep 10
+-      echo "something went wrong"
+       '';
+ 
+     # This script is called after `rc.shutdown` completes.  It isn't usually

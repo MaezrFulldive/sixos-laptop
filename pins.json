@@ -1,0 +1,18 @@
+{
+  "sixos": {
+    "url": "https://codeberg.org/amjoseph/sixos",
+    "branch": "master",
+    "rev": "26c564b4b4c1957259b065636e71f4ef87da0295",
+    "sha256": "18hnkfdah8acbf70jw8zfj72axf7r2y4w5gah7nalndznqdrn24f"
+  },
+  "nixpkgs-base": {
+    "url": "https://github.com/nixos/nixpkgs/archive/38edd08881ce4dc24056eec173b43587a93c990f.tar.gz",
+    "sha256": "049wkiwhw512wz95vxpxx65xisnd1z3ay0x5yzgmkzafcxvx9ckw"
+  },
+  "nixpkgs-desktop": {
+    "url": "https://github.com/NixOS/nixpkgs",
+    "branch": "nixos-26.05",
+    "rev": "0dc498bfe49baeb18b0f9891e800b53bb2603193",
+    "sha256": "09m91kcd36jg2lvvrfy0qwk7frsjn84hfn497bax4rmcrfmj7zdk"
+  }
+}

@@ -1,0 +1,111 @@
+name: Update pins
+
+# Every Monday: move pins.json (and the table in README.md) to the newest
+# sixos commit and the newest commit of the pinned NixOS release, run the
+# full VM test, and push the update to main only if the test passes.  If it
+# fails, the update is pushed to a branch and an issue is opened instead.
+#
+# When a newer NixOS release (nixos-YY.MM) exists, a pull request switching
+# to it is opened, with the test result in its description.  Release
+# upgrades are never merged automatically.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: update-pins
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-nix
+
+      - name: git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update pins on the current branches
+        id: pins
+        run: python3 scripts/update-pins.py --github-output
+
+      - name: Test the update
+        id: test
+        if: steps.pins.outputs.changed == 'true'
+        continue-on-error: true
+        run: nix-build tests -A all --no-out-link
+
+      - name: Tests passed, push to main
+        if: steps.pins.outputs.changed == 'true' && steps.test.outcome == 'success'
+        env:
+          SUMMARY: ${{ steps.pins.outputs.summary }}
+        run: |
+          git add pins.json README.md
+          git commit -m "pins: update" -m "$SUMMARY" -m "VM test passed: $RUN_URL"
+          git push origin HEAD:main
+
+      - name: Tests failed, push a branch and open an issue
+        if: steps.pins.outputs.changed == 'true' && steps.test.outcome != 'success'
+        env:
+          SUMMARY: ${{ steps.pins.outputs.summary }}
+        run: |
+          branch=auto/update-pins
+          git checkout -B "$branch"
+          git add pins.json README.md
+          git commit -m "pins: update (tests FAILED)" -m "$SUMMARY"
+          git push --force origin "$branch"
+          title="Automatic pin update failed its tests"
+          body=$(printf 'The weekly update could not be applied, because the VM test failed with the new versions:\n\n%s\n\nLog: %s\nThe updated pins are on the branch `%s`. main is unchanged, so the instructions keep working with the old versions.\n' \
+            "$SUMMARY" "$RUN_URL" "$branch")
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+          exit 1
+
+      - name: Look for a newer NixOS release
+        id: release
+        if: ${{ !cancelled() }}
+        run: |
+          git checkout -q -f main && git pull -q origin main || true
+          python3 scripts/update-pins.py --check-new-release --github-output
+
+      - name: Try the newer release
+        if: ${{ !cancelled() && steps.release.outputs.new_release != '' }}
+        env:
+          RELEASE: ${{ steps.release.outputs.new_release }}
+        run: |
+          release="$RELEASE"
+          branch="auto/$release"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then
+            echo "branch $branch already exists; not opening another pull request"
+            exit 0
+          fi
+          git checkout -B "$branch"
+          summary=$(python3 scripts/update-pins.py --release "$release")
+          if nix-build tests -A all --no-out-link; then
+            result="✅ The VM test passed with $release."
+          else
+            result="❌ The VM test FAILED with $release. See the log before merging."
+          fi
+          git add pins.json README.md
+          git commit -m "pins: switch to $release" -m "$summary"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Switch to $release" \
+            --body "$(printf '%s\n\n%s\n\nLog: %s\n\nRelease upgrades are not merged automatically: read the NixOS release notes for anything affecting the kernel, mesa, ly or mango, then merge.\n' \
+              "$result" "$summary" "$RUN_URL")"

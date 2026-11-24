@@ -1,0 +1,32 @@
+diff --git a/mkConfiguration/default.nix b/mkConfiguration/default.nix
+index c6e2e59..2a66d6e 100644
+--- a/mkConfiguration/default.nix
++++ b/mkConfiguration/default.nix
+@@ -65,13 +65,25 @@ let
+ 
+   # FIXME(amjoseph): do the same abduco trick here that we already do in the initrd
+   # FIXME(amjoseph): should be using boot.initrd.ttys instead of boot.kernel.console here
+-  early-getty = lib.concatStringsSep " " [
++  #
++  # If `boot.console-autologin` is true (the default), the console gets a root
++  # shell without any password.  If false, it gets an ordinary `login:` prompt
++  # (busybox login, which checks /etc/passwd and /etc/shadow; it understands
++  # SHA-512 `$6$` hashes but not yescrypt `$y$` hashes).
++  #
++  console-autologin = boot.console-autologin or true;
++  early-getty = lib.concatStringsSep " " ([
+     "${pkgs.busybox}/bin/getty"
++  ] ++ (if console-autologin then [
+     "-nl"
+     "${pkgs.busybox}/bin/sh"
++  ] else [
++    "-l"
++    "${pkgs.busybox}/bin/login"
++  ]) ++ [
+     "${toString (boot.kernel.console.baud or 115200)}"
+     "${boot.kernel.console.device or "tty0"}"
+-  ];
++  ]);
+ 
+   # note: add-spaths must be the last extension before
+   # "convert-before-to-after", to be sure that it is able to "see" any

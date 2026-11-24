@@ -1,0 +1,15 @@
+diff --git a/by-name/md/mdevd/helpers.nix b/by-name/md/mdevd/helpers.nix
+index eec7439..eac1dfe 100644
+--- a/by-name/md/mdevd/helpers.nix
++++ b/by-name/md/mdevd/helpers.nix
+@@ -20,7 +20,9 @@ in
+ stdenv.mkDerivation {
+   inherit pname version;
+   src = pkgs.fetchFromGitHub {
+-    owner = "slashbeast";
++    # github.com/slashbeast/mdev-like-a-boss was deleted; this copy serves
++    # the same commit, and the hash below guarantees identical contents.
++    owner = "8l";
+     repo = pname;
+     rev = "f77310ea8e039282a545f17df676f2e42f112746";
+     hash = "sha256-dGUSyE4/0od7CGM600+51JZZsJtYt1qLK2oSa92blzw=";
