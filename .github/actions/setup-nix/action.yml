@@ -10,6 +10,13 @@ runs:
           /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup || true
         df -h /
 
+    - name: Allow nested sandboxes
+      shell: bash
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor.
+      # The test suite of the Nix 2.3 that sixos uses (built from source,
+      # since it isn't in the binary cache) needs them.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
     - name: Enable KVM
       shell: bash
       run: |
