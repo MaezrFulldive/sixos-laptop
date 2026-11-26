@@ -245,6 +245,10 @@ HASH=$(mkpasswd -m sha512)                            # asks for the new passwor
 doas sed -i "s|^me:[^:]*:|me:$HASH:|" /etc/shadow     # use root instead of me for root
 ```
 
+**Next: [docs/](docs/README.md)** explains how to configure and use the
+system: adding programs, sound, services, several machines, and how sixos
+differs from NixOS (infusions instead of modules, s6 instead of systemd).
+
 ---
 
 ## 6. Updating later
@@ -326,6 +330,13 @@ mount -o ro LABEL=sixos /root
 exec /early/finish             # continue booting
 ```
 
+**ly is only partly drawn (parts appear only when they change)**
+The GPU driver took over the screen after ly had drawn it. ly waits up to 15
+seconds for a GPU driver (i915, amdgpu, nouveau...) before starting; if
+yours loads later or not at all, `dmesg | grep -i drm` shows what happened.
+Restarting ly redraws it: log in as root on tty2 and run
+`s6-svc -r /run/service/ly`.
+
 **tty1 stays blank (no ly)**
 Switch to tty2 (Ctrl+Alt+F2), log in as root, and check
 `s6-rc -a list | grep -e ly -e seatd -e run-user` and
@@ -336,10 +347,12 @@ Switch to tty2 (Ctrl+Alt+F2), log in as root, and check
 contain a `$6$...` hash for your user and be mode 600.
 
 **mango starts and exits immediately (you're back in ly)**
-Read `~/ly-session.log` and `/var/log/ly.log`. Then check that
+Read `~/ly-session.log` and `/var/log/ly.log`. A wrong command in
+`session-commands` doesn't stop mango, but a broken `~/.config/mango/config.conf`
+does. Then check that
 `/run/user/1000` exists, that `/run/seatd.sock` exists, and that `id` lists
 `_video`. To see mango's own errors, log in on tty2 as your user and run
-`XDG_RUNTIME_DIR=/run/user/1000 mango`.
+`XDG_RUNTIME_DIR=/run/user/1000 mango-session`.
 
 **`doas: Authentication failed` / `doas: not permitted`**
 You must be in `wheel` (`id`) and type *your* password. The password check
@@ -357,8 +370,7 @@ Read `/var/log/wifi/current`. "does not exist yet, sleeping" means the
 `dmesg` point at a missing or wrong `module`.
 
 **No sound**
-Add `pipewire` and `wireplumber` to `extra-packages` and start them from
-mango's config (`exec-once=`).
+Sound is not set up by default: see [docs/configuring.md](docs/configuring.md#sound).
 
 **A system that won't boot at all**
 Pick "sixos (fallback)" in GRUB. If that fails too, boot the live USB, then
@@ -378,6 +390,8 @@ that matters, set a GRUB password (`grub-mkpasswd-pbkdf2`, then
 | --- | --- |
 | [`site/hosts/laptop.nix`](site/hosts/laptop.nix) | **your** settings |
 | [`nix/laptop.nix`](nix/laptop.nix) | the system configuration: ly, mango, doas, PAM, kernel, services |
+| [`docs/`](docs/README.md) | how to configure and use the installed system |
+| [`by-name/`](by-name) | services of your own ([docs/services.md](docs/services.md)) |
 | [`pins.json`](pins.json) | every upstream source, updated weekly |
 | [`patches/sixos/`](patches/sixos) | changes to upstream sixos (below) |
 | [`scripts/install-on-live-usb`](scripts/install-on-live-usb) | the install command from step 4 |
@@ -396,7 +410,9 @@ The patches to sixos:
    being recompiled.
 3. `0003`: `poweroff` no longer reboots (the shutdown script ended with a
    forced `reboot`).
-4. `0004`: the `ly-dm` service (the ly display manager).
+4. `0004`: the `ly-dm` service (the ly display manager). It waits for the
+   GPU driver before drawing, so the driver taking over the screen doesn't
+   leave ly half-drawn.
 5. `0005`: downloads `mdev-like-a-boss` from a mirror. Its original GitHub
    repository was deleted, which breaks every sixos build; the hash pins the
    exact same contents.

@@ -1,9 +1,9 @@
 diff --git a/by-name/ly/ly-dm/service.nix b/by-name/ly/ly-dm/service.nix
 new file mode 100644
-index 0000000..abb17e2
+index 0000000..0ed07de
 --- /dev/null
 +++ b/by-name/ly/ly-dm/service.nix
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,145 @@
 +#
 +# ly: a TUI display manager (login screen).  https://codeberg.org/fairyglade/ly
 +#
@@ -42,6 +42,15 @@ index 0000000..abb17e2
 +
 +# additional targets which must be up before ly starts (e.g. seatd)
 +, after ? []
++
++# Seconds to wait for a real GPU driver before starting ly (0: don't wait).
++#
++# Until the GPU's kernel driver (i915, amdgpu, nouveau, ...) has loaded, the
++# console is drawn by simpledrm/efifb on the framebuffer the firmware left
++# behind.  When the real driver loads it takes over the console and wipes
++# it, and ly (which only redraws the cells that change) is left mostly blank.
++# mdevd loads that driver while ly is starting, so wait for it.
++, wait-for-gpu ? 15
 +
 +# user name preselected on the very first start, before ly has remembered
 +# anyone (ly's login field is a list you cycle with Left/Right, not a text
@@ -99,6 +108,25 @@ index 0000000..abb17e2
 +  '' + lib.optionalString (default-user != null) ''
 +    # ly's save file: the index of the last user, then "user:session" lines
 +    [ -e /etc/ly/save.txt ] || printf '0\n%s:0\n' ${lib.escapeShellArg default-user} > /etc/ly/save.txt
++  '' + ''
++
++  '' + lib.optionalString (wait-for-gpu > 0) ''
++
++    # Wait (at most ${toString wait-for-gpu}s) until a DRM device is driven by something other
++    # than the firmware framebuffer, then give fbcon a moment to take over.
++    i=0
++    while [ $i -lt ${toString (wait-for-gpu * 10)} ]; do
++      for card in /sys/class/drm/card[0-9]*; do
++        [ -e "$card/device/driver" ] || continue
++        driver=$(${busybox} basename "$(${busybox} readlink "$card/device/driver")")
++        case "$driver" in
++          simple-framebuffer|simpledrm|efi-framebuffer|vesa-framebuffer) ;;
++          *) ${busybox} sleep 1; break 2 ;;
++        esac
++      done
++      ${busybox} sleep 0.1
++      i=$((i + 1))
++    done
 +  '' + ''
 +
 +    # ly draws on the *active* virtual terminal, so make ours the active one,

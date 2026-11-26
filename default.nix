@@ -17,6 +17,9 @@ let
     # not define, so it is turned off.
     check-types = false;
 
+    # Services of our own, next to sixos's (docs/services.md)
+    extra-by-name-dirs = [ ./by-name ];
+
     # Extra arguments available to every file under site/
     extra-auto-args = {
       inherit sources;

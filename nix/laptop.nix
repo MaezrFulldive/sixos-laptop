@@ -37,6 +37,20 @@
   # the installer's --ssh-key) and push updates.  Off by default: sixos's
   # sshd service always compiles its own openssh.
 , sshd ? false
+
+  # Programs started in the background when you log in through ly, and
+  # stopped when mango exits: this setup's replacement for systemd user
+  # services.  They run as you, inside the session's D-Bus bus, e.g.
+  #   [ "pipewire" "wireplumber" "pipewire-pulse" ]
+  # (the programs themselves go in extra-packages).
+, session-commands ? [ ]
+
+  # More configuration for this one machine, as infusions on the host (see
+  # docs/sixos-for-nixos-users.md), e.g.
+  #   host: { targets.earlyoom.__assign = host.services.earlyoom { }; }
+  # `host` is the finished host (host-final); its .services, .targets and
+  # .pkgs are what sixos passes to services.
+, extra-config ? (host: [ ])
 }:
 
 host-final: host-prev:
@@ -61,6 +75,29 @@ let
   # rebroadcast hotplug events for it).  LD_LIBRARY_PATH overrides the
   # libraries' RUNPATH, so no rebuild is needed; programs started from mango
   # inherit it.
+  #
+  # ly starts the session's `Exec=` command, which is changed from `mango` to
+  # `mango-session`: it gives the session a D-Bus session bus (there is no
+  # systemd/logind to provide one; portals, notifications, pipewire and many
+  # GTK/Qt programs expect it), starts `session-commands`, runs mango, and
+  # stops those commands again when mango exits.
+  dbus = desktop-pkgs.dbus;
+  mango-session = desktop-pkgs.writeShellScript "mango-session" ''
+    if [ -z "''${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+      exec ${dbus}/bin/dbus-run-session \
+        --dbus-daemon=${dbus}/bin/dbus-daemon \
+        --config-file=${dbus}/share/dbus-1/session.conf -- "$0" "$@"
+    fi
+    # .desktop files (rofi -show drun), icons, D-Bus services ...  (ly sets
+    # PATH from its own config but doesn't read /etc/profile)
+    export XDG_DATA_DIRS=''${XDG_DATA_DIRS:-/run/current-system/sw/share}
+    ${lib.concatMapStrings (cmd: "${cmd} &\n") session-commands}
+    @out@/bin/mango "$@"
+    status=$?
+    # shellcheck disable=SC2046
+    kill $(jobs -p) 2>/dev/null
+    exit $status
+  '';
   mango = desktop-pkgs.symlinkJoin {
     name = "mango-with-libudev-zero";
     paths = [ desktop-pkgs.mangowc ];
@@ -68,6 +105,12 @@ let
     postBuild = ''
       wrapProgram $out/bin/mango \
         --prefix LD_LIBRARY_PATH : ${desktop-pkgs.libudev-zero}/lib
+      substitute ${mango-session} $out/bin/mango-session --subst-var out
+      chmod +x $out/bin/mango-session
+      for f in $out/share/wayland-sessions/*.desktop; do
+        sed 's|^Exec=mango$|Exec=mango-session|' "$(readlink -f "$f")" > "$f.new"
+        mv "$f.new" "$f"
+      done
     '';
   };
 
@@ -136,6 +179,8 @@ infuse host-prev ([{
     "etc/profile" = pkgs.writeText "profile" ''
       # /run/six/bin first: that's where the setuid-root doas lives
       export PATH=/run/six/bin:/run/current-system/sw/bin
+      # .desktop files (rofi -show drun), icons, D-Bus services, man pages ...
+      export XDG_DATA_DIRS=/run/current-system/sw/share
     '';
     "etc/mango/config.conf" = "${desktop-pkgs.mangowc.src}/assets/config.conf";
     "etc/fonts/fonts.conf" = desktop-pkgs.makeFontsConf {
@@ -299,4 +344,7 @@ infuse host-prev ([{
     conf_directory = "/etc/iwd";
   };
 
-})
+}
+
+# the machine's own extra-config comes last, so it can change anything above
+++ lib.toList (extra-config host-final))

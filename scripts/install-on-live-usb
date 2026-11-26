@@ -22,9 +22,10 @@ usage() {
 Usage: sudo scripts/install-on-live-usb --disk DEV --user NAME [options]
 
   --disk DEV        the disk to ERASE, e.g. /dev/nvme0n1 (`lsblk -d`)
-  --user NAME       the `username` in site/hosts/laptop.nix
+  --user NAME       the `username` in site/hosts/HOST.nix
 
 Options:
+  --host HOST       which machine in site/hosts/ to install (default: laptop)
   --wifi SSID       Wi-Fi network for the installed system (asks for the
                     passphrase)
   --ssh-key FILE    public key allowed to log in as root over ssh; only
@@ -42,13 +43,14 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MNT=/mnt
 
-DISK='' USERNAME='' USER_UID=1000 RESUME=''
+DISK='' USERNAME='' USER_UID=1000 RESUME='' HOST=laptop
 PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk) DISK=$2; shift 2 ;;
     --user) USERNAME=$2; shift 2 ;;
     --uid) USER_UID=$2; shift 2 ;;
+    --host) HOST=$2; shift 2 ;;
     --wifi) PASS+=(--wifi "$2"); shift 2 ;;
     --ssh-key)
       [ -f "$2" ] || die "--ssh-key: $2 does not exist"
@@ -65,8 +67,9 @@ done
 command -v nix-build >/dev/null || die "no nix-build: boot the NixOS live USB"
 [ -d /sys/firmware/efi ] || echo "warning: not booted with UEFI; the laptop may not boot the installed system" >&2
 
-grep -q "username *= *\"$USERNAME\"" "$ROOT/site/hosts/laptop.nix" \
-  || die "--user $USERNAME does not match the username in site/hosts/laptop.nix"
+[ -f "$ROOT/site/hosts/$HOST.nix" ] || die "--host: there is no site/hosts/$HOST.nix"
+grep -q "username *= *\"$USERNAME\"" "$ROOT/site/hosts/$HOST.nix" \
+  || die "--user $USERNAME does not match the username in site/hosts/$HOST.nix"
 
 # ---------------------------------------------------------------------------
 step "Building the installer"
@@ -103,7 +106,7 @@ step "Building the system into $MNT/nix/store"
 WORK=$MNT/nix/install-tmp
 mkdir -p "$WORK/build" "$WORK/cache"
 SYSTEM=$(TMPDIR=$WORK/build XDG_CACHE_HOME=$WORK/cache \
-  nix-build "$ROOT" -A hosts.laptop.configuration --store "$MNT" --no-out-link \
+  nix-build "$ROOT" -A "hosts.$HOST.configuration" --store "$MNT" --no-out-link \
   --option max-jobs auto --option cores 0) \
   || die "the build failed; fix the cause, then run the same command again with --resume"
 [ -n "$SYSTEM" ] || die "the build printed no store path"

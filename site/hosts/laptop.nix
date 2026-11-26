@@ -19,6 +19,15 @@ laptop-host args {
   # More programs, from nixpkgs (search on https://search.nixos.org/packages):
   # extra-packages = pkgs: with pkgs; [ firefox ];
 
+  # Programs that run while you're logged in (docs/services.md), e.g. sound
+  # (also add pipewire and wireplumber to extra-packages):
+  # session-commands = [ "pipewire" "wireplumber" "pipewire-pulse" ];
+
+  # Anything else, as infusions (docs/multiple-machines.md), e.g. a service:
+  # extra-config = host: {
+  #   targets.earlyoom.__assign = host.services.earlyoom { };
+  # };
+
   # Run sshd, to push updates from another computer (README.md step 6).
   # It adds one more package to compile (openssh).
   # sshd = true;

@@ -240,7 +240,7 @@ time.sleep(2)
 login("root", args.root_password, wait_for_prompt=False)
 check("test \"$(id -u)\" = 0", "root logged in with the root password")
 
-for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly"]:
+for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly", "earlyoom"]:
     wait_until(f"s6-rc -a list | grep -qx '{svc}'", f"service {svc} is up", 120)
 wait_until("pidof ly", "ly is running", 60)
 
@@ -318,6 +318,13 @@ else:
     screenshot("mango")
     check(f"test \"$(stat -c %U /proc/$(pidof mango | cut -d' ' -f1))\" = {args.user}",
           "mango runs as the user, not root")
+    # mango-session: D-Bus session bus and session-commands (tests/site/hosts/testvm.nix)
+    check(f"test \"$(stat -c %U /proc/$(pidof dbus-daemon | cut -d' ' -f1))\" = {args.user}",
+          "the session has a D-Bus session bus")
+    check(f"test \"$(stat -c %U /proc/$(pidof pipewire | cut -d' ' -f1))\" = {args.user}",
+          "session-commands started pipewire as the user")
+    check("tr '\\0' '\\n' < /proc/$(pidof mango | cut -d' ' -f1)/environ | grep -qx 'XDG_DATA_DIRS=/run/current-system/sw/share'",
+          "the session has XDG_DATA_DIRS")
 
 ###########################################################################
 # 5. poweroff powers off (sixos upstream turned it into a reboot)
