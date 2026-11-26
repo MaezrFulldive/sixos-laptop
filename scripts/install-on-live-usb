@@ -81,9 +81,17 @@ if [ -z "$RESUME" ]; then
   "$INSTALLER/bin/sixos-install" --phase prepare \
     --disk "$DISK" --user "$USERNAME" --uid "$USER_UID" --copy "$ROOT" "${PASS[@]}"
 else
-  if ! mountpoint -q "$MNT" || ! mountpoint -q "$MNT/boot"; then
-    die "--resume: $MNT is not mounted (run without --resume to start over)"
-  fi
+  # mount the partitions an earlier run made, e.g. after a reboot
+  case "$DISK" in
+    *[0-9]) PART=${DISK}p ;;   # /dev/nvme0n1 -> /dev/nvme0n1p1
+    *) PART=$DISK ;;           # /dev/sda -> /dev/sda1
+  esac
+  mountpoint -q "$MNT" || mount "${PART}2" "$MNT" \
+    || die "--resume: could not mount ${PART}2 (run without --resume to start over)"
+  mountpoint -q "$MNT/boot" || mount "${PART}1" "$MNT/boot" \
+    || die "--resume: could not mount ${PART}1 (run without --resume to start over)"
+  [ -e "$MNT/etc/shadow" ] && [ -d "$MNT/nix/store" ] \
+    || die "--resume: $MNT is not a prepared sixos disk (run without --resume)"
 fi
 
 # ---------------------------------------------------------------------------

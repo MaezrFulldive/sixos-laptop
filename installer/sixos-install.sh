@@ -264,10 +264,31 @@ ln -sfn /nix/var/nix/profiles "$MNT/nix/var/nix/gcroots/profiles"
 step "Kernel, initrd and GRUB"
 # ---------------------------------------------------------------------------
 
+# boot/kernel and boot/initrd are symlinks to absolute /nix/store/... paths.
+# Those must be followed inside $MNT: when the system was built straight into
+# $MNT/nix/store (install-on-live-usb), the live USB's own /nix/store doesn't
+# have them, so `cp -L` would fail.
+in_mnt() {
+  local p=$1 t n=0
+  while [ -L "$MNT$p" ]; do
+    n=$((n + 1)); [ "$n" -le 40 ] || die "too many symlinks at $MNT$1"
+    t=$(readlink "$MNT$p")
+    case "$t" in
+      /*) p=$t ;;
+      *) p=$(dirname "$p")/$t ;;
+    esac
+  done
+  [ -e "$MNT$p" ] || die "$MNT$1 points to $p, which is not in $MNT"
+  echo "$MNT$p"
+}
+KERNEL=$(in_mnt "$SYSTEM/boot/kernel")
+INITRD=$(in_mnt "$SYSTEM/boot/initrd")
+
 # Same layout that sixos's `nextboot` keeps up to date later on
 for d in normal fallback; do
   mkdir -p "$MNT/boot/sixos/$d"
-  cp -L "$MNT$SYSTEM/boot/kernel" "$MNT$SYSTEM/boot/initrd" "$MNT/boot/sixos/$d/"
+  cp "$KERNEL" "$MNT/boot/sixos/$d/kernel"
+  cp "$INITRD" "$MNT/boot/sixos/$d/initrd"
 done
 
 # Always install at the fallback path EFI/BOOT/BOOTX64.EFI, which every UEFI
