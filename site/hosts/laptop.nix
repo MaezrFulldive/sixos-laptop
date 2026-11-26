@@ -6,18 +6,22 @@ args@{ laptop-host, ... }:
 
 laptop-host args {
 
-  username = "me";                                   # CHANGE ME
+  username = "maezr";                                   # CHANGE ME
 
   # "nvme" for an NVMe SSD, "ahci" for a SATA disk   # CHANGE ME
   root-disk-modules = [ "nvme" ];
 
   wifi = {
     module = "iwlwifi";                              # CHANGE ME
-    sysfs = "/sys/devices/pci0000:00/0000:00:14.3";  # CHANGE ME
+    sysfs = "/sys/devices/pci0000:00/0000:00:1c.2/0000:3b:00.0";  # CHANGE ME
   };
 
   # More programs, from nixpkgs (search on https://search.nixos.org/packages):
   # extra-packages = pkgs: with pkgs; [ firefox ];
+
+  # Run sshd, to push updates from another computer (README.md step 6).
+  # It adds one more package to compile (openssh).
+  # sshd = true;
 
   # Extra ly settings, see https://codeberg.org/fairyglade/ly (res/config.ini):
   # ly-settings = { animation = "matrix"; bigclock = "en"; };

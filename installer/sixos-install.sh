@@ -8,6 +8,10 @@ usage() {
   cat <<'EOF'
 Usage: sixos-install --disk DEV --system PATH --user NAME [options]
 
+Usually you don't run this yourself: scripts/install-over-ssh (on the build
+machine) runs it on the live USB in two phases and copies the system in
+between.
+
 Required:
   --disk DEV        the whole disk to ERASE, e.g. /dev/nvme0n1 or /dev/sda
   --system PATH     the built system: the store path `readlink -f result`
@@ -26,6 +30,11 @@ Options:
   --yes             don't ask before erasing the disk
   --no-nvram        don't add a firmware boot entry; only install GRUB at the
                     fallback path EFI/BOOT/BOOTX64.EFI (always done anyway)
+  --phase PHASE     all (default): everything, copying the system with --from
+                    prepare: ask questions, partition, mount at /mnt, write
+                             /etc; then stop, so the system can be copied into
+                             /mnt from elsewhere (--system is not needed)
+                    finish:  after the copy: boot profiles, GRUB, unmount
 
 Passwords are asked for interactively.  For unattended installs, set
 SIXOS_ROOT_PASSWORD_HASH and SIXOS_USER_PASSWORD_HASH to SHA-512 crypt
@@ -37,7 +46,7 @@ die() { echo "sixos-install: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
 DISK='' SYSTEM='' USERNAME='' FROM='' USER_UID=1000 SSH_KEY='' WIFI_SSID='' COPY_DIR=''
-ESP_SIZE=1GiB ASSUME_YES='' NO_NVRAM=''
+ESP_SIZE=1GiB ASSUME_YES='' NO_NVRAM='' PHASE=all
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk) DISK=$2; shift 2 ;;
@@ -51,16 +60,22 @@ while [ $# -gt 0 ]; do
     --esp-size) ESP_SIZE=$2; shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
     --no-nvram) NO_NVRAM=1; shift ;;
+    --phase) PHASE=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
 done
 
-[ -n "$DISK" ] && [ -n "$SYSTEM" ] && [ -n "$USERNAME" ] || { usage >&2; exit 1; }
+case "$PHASE" in
+  all|prepare|finish) ;;
+  *) die "--phase must be all, prepare or finish" ;;
+esac
+[ -n "$DISK" ] && [ -n "$USERNAME" ] || { usage >&2; exit 1; }
+[ "$PHASE" = prepare ] || [ -n "$SYSTEM" ] || { usage >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "must be run as root (sudo -i)"
 [ -b "$DISK" ] || die "$DISK is not a block device"
 case "$SYSTEM" in
-  /nix/store/*) ;;
+  ''|/nix/store/*) ;;
   *) die "--system must be a /nix/store/... path (run \`readlink -f result\` on the build machine)" ;;
 esac
 if [ -n "$COPY_DIR" ] && [ ! -d "$COPY_DIR" ]; then die "--copy: $COPY_DIR is not a directory"; fi
@@ -73,6 +88,8 @@ esac
 ESP=${PART}1
 ROOT=${PART}2
 MNT=/mnt
+
+if [ "$PHASE" != finish ]; then   # (not indented, to keep the diff readable)
 
 # ---------------------------------------------------------------------------
 # Ask everything up front, so the rest runs unattended
@@ -132,33 +149,6 @@ mkdir -p "$MNT/boot"
 mount "$ESP" "$MNT/boot"
 
 # ---------------------------------------------------------------------------
-step "Copying the system and everything it needs into $MNT/nix/store"
-# ---------------------------------------------------------------------------
-
-if [ -n "$FROM" ]; then
-  nix --extra-experimental-features nix-command copy --no-check-sigs \
-    --from "$FROM" --to "$MNT" "$SYSTEM"
-else
-  nix --extra-experimental-features nix-command copy --no-check-sigs \
-    --to "$MNT" "$SYSTEM"
-fi
-[ -e "$MNT$SYSTEM/bin/activate" ] || die "$SYSTEM does not look like a sixos system (no bin/activate)"
-
-# ---------------------------------------------------------------------------
-step "Boot profiles"
-# ---------------------------------------------------------------------------
-
-# The initrd boots whatever /nix/var/nix/profiles/nextboot points to.
-P=$MNT/nix/var/nix/profiles
-mkdir -p "$P/per-user"   # the first activation needs this
-ln -sfn "$SYSTEM" "$P/nextboot-1-link"
-ln -sfn nextboot-1-link "$P/nextboot"
-ln -sfn "$SYSTEM" "$P/fallbackboot-1-link"
-ln -sfn fallbackboot-1-link "$P/fallbackboot"
-mkdir -p "$MNT/nix/var/nix/gcroots"
-ln -sfn /nix/var/nix/profiles "$MNT/nix/var/nix/gcroots/profiles"
-
-# ---------------------------------------------------------------------------
 step "Directories, passwords and /etc"
 # ---------------------------------------------------------------------------
 
@@ -170,10 +160,12 @@ install -d -m 0700 -o "$USER_UID" -g "$USER_UID" "$MNT/home/$USERNAME"
 
 # Password hashes live only here, never in the Nix store.  SHA-512 ($6$)
 # because busybox `login` doesn't understand yescrypt.
+set +x   # don't print the hashes
 (
   umask 077
   printf 'root:%s:::::::\n%s:%s:::::::\n' "$ROOT_HASH" "$USERNAME" "$USER_HASH" > "$MNT/etc/shadow"
 )
+set -x
 chmod 600 "$MNT/etc/shadow"
 
 # /etc entries that follow the running configuration (and so every update)
@@ -224,6 +216,49 @@ if [ -n "$COPY_DIR" ]; then
   rm -f "$MNT/home/$USERNAME/$(basename "$COPY_DIR")"/result*
   chown -R "$USER_UID:$USER_UID" "$MNT/home/$USERNAME"
 fi
+
+fi  # end of the prepare part
+
+if [ "$PHASE" = prepare ]; then
+  set +x
+  echo
+  echo "$DISK is partitioned and mounted at $MNT.  Copy the system into $MNT,"
+  echo "then run this again with --phase finish."
+  exit 0
+fi
+
+if [ "$PHASE" = finish ]; then
+  if ! mountpoint -q "$MNT" || ! mountpoint -q "$MNT/boot"; then
+    die "$MNT is not mounted: run --phase prepare first"
+  fi
+  set -x
+else
+  # -------------------------------------------------------------------------
+  step "Copying the system and everything it needs into $MNT/nix/store"
+  # -------------------------------------------------------------------------
+  if [ -n "$FROM" ]; then
+    nix --extra-experimental-features nix-command copy --no-check-sigs \
+      --from "$FROM" --to "$MNT" "$SYSTEM"
+  else
+    nix --extra-experimental-features nix-command copy --no-check-sigs \
+      --to "$MNT" "$SYSTEM"
+  fi
+fi
+[ -e "$MNT$SYSTEM/bin/activate" ] || die "$SYSTEM is not in $MNT/nix/store, or is not a sixos system (no bin/activate)"
+
+# ---------------------------------------------------------------------------
+step "Boot profiles"
+# ---------------------------------------------------------------------------
+
+# The initrd boots whatever /nix/var/nix/profiles/nextboot points to.
+P=$MNT/nix/var/nix/profiles
+mkdir -p "$P/per-user"   # the first activation needs this
+ln -sfn "$SYSTEM" "$P/nextboot-1-link"
+ln -sfn nextboot-1-link "$P/nextboot"
+ln -sfn "$SYSTEM" "$P/fallbackboot-1-link"
+ln -sfn fallbackboot-1-link "$P/fallbackboot"
+mkdir -p "$MNT/nix/var/nix/gcroots"
+ln -sfn /nix/var/nix/profiles "$MNT/nix/var/nix/gcroots/profiles"
 
 # ---------------------------------------------------------------------------
 step "Kernel, initrd and GRUB"

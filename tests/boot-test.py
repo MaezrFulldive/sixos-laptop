@@ -240,7 +240,7 @@ time.sleep(2)
 login("root", args.root_password, wait_for_prompt=False)
 check("test \"$(id -u)\" = 0", "root logged in with the root password")
 
-for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "sshd", "ly"]:
+for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly"]:
     wait_until(f"s6-rc -a list | grep -qx '{svc}'", f"service {svc} is up", 120)
 wait_until("pidof ly", "ly is running", 60)
 
@@ -249,6 +249,13 @@ check(f"grep -q '^{args.user}:x:' /etc/passwd", "/etc/passwd points at /etc/shad
 check("test ! -e /run/current-system/etc/shadow", "no password hashes in the Nix store")
 check(f"test \"$(stat -c %u /run/user/{args.uid})\" = {args.uid}", "/run/user/<uid> exists")
 check("grep -qx 'permit :wheel' /etc/doas.conf", "doas.conf requires a password")
+check(f"test \"$(stat -c %U /home/{args.user}/sixos-laptop/pins.json)\" = {args.user}",
+      "the repository was copied to the user's home")
+check(f"test ! -e /home/{args.user}/sixos-laptop/result && test ! -L /home/{args.user}/sixos-laptop/result",
+      "the repository copy has no result links")
+check("grep -q ssh-ed25519 /root/.ssh/authorized_keys", "the --ssh-key was installed")
+check("ls /run/booted-system/firmware/lib/firmware/iwlwifi-*.zst | head -n 1 | grep -q zst",
+      "the firmware is zstd-compressed")
 for c in DIAGNOSTICS:     # recorded in the log, useful when a later step fails
     run(c, 30)
 logout()

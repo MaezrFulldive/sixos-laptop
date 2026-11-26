@@ -37,14 +37,16 @@ these instructions, so you never paste a hash by hand. Currently pinned:
   opens a pull request for you to review instead of switching on its own.
 - **Every push and pull request** runs the [test workflow](.github/workflows/test.yml).
   The same test runs locally with `nix-build tests -A all`.
-  It builds the laptop configuration, then runs the real
-  [installer](installer/sixos-install.sh) inside a VM onto an empty disk.
+  It builds the laptop configuration, then runs the over-ssh install command
+  ([`scripts/install-over-ssh`](scripts/install-over-ssh), which runs the same
+  [`installer/sixos-install.sh`](installer/sixos-install.sh) as the live-USB
+  install) inside a VM onto an empty disk.
   It boots that disk with UEFI and an NVMe drive, the way a laptop does, and
   checks the following ([details](tests/default.nix)):
   - the system boots to a login prompt
   - passwords work for root and the user
   - `doas` asks for a password and rejects a wrong one
-  - ly, seatd, dnscache and sshd are running
+  - ly, seatd and dnscache are running
   - logging in through ly starts mango (a screenshot is saved)
   - `poweroff` powers off instead of rebooting
 
@@ -58,18 +60,18 @@ these instructions, so you never paste a hash by hand. Currently pinned:
 
 ## 0. Before you start
 
-Two machines are involved:
+Everything happens on the laptop itself, booted from a **NixOS live USB**.
+The live USB already has `nix`; you only use it for the install and don't
+install NixOS. The laptop's disk is **completely erased**.
 
-| name in this guide | what it is |
-| --- | --- |
-| **build machine** | your current Linux computer (Arch here). It builds the system. |
-| **target laptop** | the laptop that gets sixos. Its disk is **completely erased**. |
-
-- The target laptop boots from a **NixOS live USB** for the install. It
-  already has `nix`, `ssh` and Wi-Fi tools. You only use it for the
-  install; you don't install NixOS.
 - **UEFI only.** Turn off **Secure Boot** in the laptop's firmware settings.
   The kernel and GRUB are not signed.
+- **Internet access** is needed during the install (about 1.8 GB is
+  downloaded from cache.nixos.org, straight onto the laptop's disk).
+- **Almost nothing is compiled.** The kernel, firmware, nix, mesa, ly and
+  mango all come prebuilt. Only a few small packages that sixos patches
+  (busybox, s6-rc, s6-linux-init, abduco, alsa-utils, mdev-like-a-boss) are
+  compiled, which takes a few minutes.
 - **Logins after the install:**
   - **tty1: ly.** Pick your user, type your password, and mango starts.
   - **tty2 (Ctrl+Alt+F2): rescue console.** Kernel messages appear here,
@@ -77,42 +79,30 @@ Two machines are involved:
   - **`doas`** asks for your password.
   - Password hashes are stored in `/etc/shadow`, readable only by root, and
     never in the Nix store.
-- **Not included yet:** sound (no audio server), disk encryption and a
-  screen locker. See [Troubleshooting](#troubleshooting) for adding sound.
+- **Not included yet:** sound (no audio server), disk encryption, a screen
+  locker, and sshd (see `sshd = true` in step 3 to add it). See
+  [Troubleshooting](#troubleshooting) for adding sound.
 
 ---
 
-## 1. Prepare the build machine
+## 1. Boot the live USB
 
-Install Nix (on Arch: `sudo pacman -S nix`), then:
-
-```sh
-sudo systemctl enable --now nix-daemon.service
-sudo systemctl enable --now sshd.service      # the laptop pulls the build over ssh
-sudo usermod -aG nix-users "$USER"            # then log out and back in
-```
-
-Get this repository and check that Nix works:
-
-```sh
-git clone https://github.com/MaezrFulldive/sixos-laptop.git ~/sixos-laptop
-cd ~/sixos-laptop
-nix-build --version
-```
-
-Write down the build machine's IP address (`ip -br addr`); this guide calls
-it `BUILD_IP`. Your user name on it is `BUILD_USER`.
-
----
-
-## 2. Collect hardware facts from the target laptop
-
-1. Download the **NixOS graphical ISO** from <https://nixos.org/download/>.
-   The graphical one makes Wi-Fi easy. Write it to a USB stick (check
-   `/dev/sdX` with `lsblk` first; everything on it is erased):
+1. Download a **NixOS ISO** from <https://nixos.org/download/>. The
+   graphical one makes Wi-Fi easy; the **minimal** one is much smaller, if
+   your USB sticks are small. Nothing else is stored on the stick: the
+   install builds the system straight onto the laptop's disk. Write the ISO
+   to a USB stick from any Linux computer (check `/dev/sdX` with `lsblk`
+   first; everything on it is erased):
    `sudo dd if=nixos-*.iso of=/dev/sdX bs=4M status=progress oflag=sync`
-2. Boot the target laptop from it and connect to the internet.
-3. Open a terminal, run these commands and write down the results:
+2. Boot the laptop from it and connect to the internet. Ethernet or USB
+   tethering from a phone needs no setup. For Wi-Fi on the minimal ISO, see
+   [networking in the NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation-manual-networking).
+
+---
+
+## 2. Collect hardware facts
+
+Open a terminal on the live USB and write down the results:
 
 ```sh
 # (a) the Wi-Fi interface name (wlan0, wlp2s0, ...)
@@ -130,14 +120,20 @@ basename "$(readlink -f /sys/class/net/wlp2s0/device/driver/module)"
 lsblk -d -o NAME,SIZE,MODEL
 ```
 
-Leave the live USB running; you'll need it again in step 4.
-
 ---
 
-## 3. Configure and build (on the build machine)
+## 3. Get this repository and configure it
 
-Open [`site/hosts/laptop.nix`](site/hosts/laptop.nix) and change the values
-marked `CHANGE ME`:
+Still on the live USB:
+
+```sh
+cd ~
+nix-shell -p git --run 'git clone https://github.com/MaezrFulldive/sixos-laptop.git'
+cd sixos-laptop
+nano site/hosts/laptop.nix
+```
+
+Change the values marked `CHANGE ME`:
 
 ```nix
   username = "me";                                   # your user name
@@ -148,78 +144,67 @@ marked `CHANGE ME`:
   };
 ```
 
-The same file shows how to add programs (`extra-packages`) and ly
-settings. Everything else is in [`nix/laptop.nix`](nix/laptop.nix), which the
-automated test also uses.
-
-Build:
-
-```sh
-cd ~/sixos-laptop
-nix-build -A hosts.laptop.configuration
-readlink -f result      # /nix/store/...-six-system-laptop-...  -> write this down: SYSTEM
-```
-
-Almost everything downloads prebuilt from cache.nixos.org (about 2 GB). Only
-a few small packages that sixos patches are compiled. If the build fails,
-see [Troubleshooting](#troubleshooting).
+The same file shows how to add programs (`extra-packages`), ly settings and
+`sshd = true` (for pushing updates from another computer, step 6; it adds
+one more compile, openssh). Everything else is in
+[`nix/laptop.nix`](nix/laptop.nix), which the automated test also uses.
 
 ---
 
-## 4. Install (on the target laptop, in the NixOS live USB)
+## 4. Install
 
-Open a terminal on the live USB and get the installer from the build machine:
-
-```sh
-scp -r BUILD_USER@BUILD_IP:sixos-laptop ~/sixos-laptop
-cd ~/sixos-laptop
-nix-build -A installer       # small: GRUB, parted, mkfs ...
-```
-
-Then run it. **It erases the whole disk.** It shows the disk and asks you to
+**This erases the whole disk.** The script shows the disk and asks you to
 type its name before doing anything:
 
 ```sh
-sudo ./result/bin/sixos-install \
-  --disk /dev/nvme0n1 \
-  --system /nix/store/...-six-system-laptop-... \
-  --user me \
-  --from ssh://BUILD_USER@BUILD_IP \
-  --wifi "MyHomeWifi" \
-  --ssh-key "$(ssh BUILD_USER@BUILD_IP cat .ssh/id_ed25519.pub)" \
-  --copy ~/sixos-laptop
+sudo ./scripts/install-on-live-usb --disk /dev/nvme0n1 --user me --wifi "MyHomeWifi"
 ```
 
 | option | value |
 | --- | --- |
 | `--disk` | `DISK` from step 2, e.g. `/dev/nvme0n1` |
-| `--system` | `SYSTEM` from step 3 |
 | `--user` | the `username` in `site/hosts/laptop.nix` |
-| `--from` | where the built system is; it is copied over ssh |
-| `--wifi` | optional: a Wi-Fi network to join (it asks for the passphrase) |
-| `--ssh-key` | optional: lets the build machine log in as root to push updates (step 6) |
-| `--copy` | optional: copies this repo into your new home directory |
+| `--wifi` | optional: a Wi-Fi network for the installed system (it asks for the passphrase) |
 
-It asks for the **root password** (rescue console) and **your password** (ly
-and doas). Then it does everything that used to be manual:
+It asks for the new system's **root password** (rescue console) and **your
+password** (ly and doas). Then it:
 
-1. partitions the disk: a 1 GiB EFI partition `ESP` and an ext4 root `sixos`
-2. copies the system into the new `/nix/store` and sets up the boot profiles
-3. writes `/etc/shadow`, the `/etc` links, ssh host keys and Wi-Fi config
-4. copies the kernel and initrd to the ESP
-5. installs GRUB (also at the fallback path `EFI/BOOT/BOOTX64.EFI`, so it
-   boots even if the firmware forgets the boot entry) and writes `grub.cfg`
+1. builds the installer (prebuilt, about 300 MB into the live USB's memory)
+2. partitions the disk: a 1 GiB EFI partition `ESP` and an ext4 root `sixos`,
+   and mounts it at `/mnt`
+3. writes `/etc/shadow`, the `/etc` links, ssh host keys and Wi-Fi config,
+   and copies this repository to `~/sixos-laptop` on the new disk
+4. builds the system **directly into `/mnt/nix/store`** (`nix-build --store
+   /mnt`), so the downloads and build files land on the disk, not in the
+   live USB's memory
+5. copies the kernel and initrd to the ESP and installs GRUB (also at the
+   fallback path `EFI/BOOT/BOOTX64.EFI`, so it boots even if the firmware
+   forgets the boot entry)
 
-`sixos-install --help` lists all options. When it says it's done:
+If it stops during the build (step 4, e.g. the network dropped), fix the
+cause and run the same command with `--resume` added: it keeps the disk and
+everything already downloaded. Without `--resume` it starts over.
 
-```sh
-reboot      # and remove the USB stick
-```
+When it says it's done, type `reboot` and remove the USB stick.
 
 > `eiwd` is iwd without D-Bus, so there is **no `iwctl`**. To add another
 > network later, create `/etc/iwd/networks/<SSID>.psk` containing
 > `[Security]` and `Passphrase=...` (see `man iwd.network` for SSIDs with
 > special characters).
+
+### Alternative: install from another computer over ssh
+
+If you'd rather build on another Linux computer with Nix,
+[`scripts/install-over-ssh`](scripts/install-over-ssh) builds the system
+there and copies it to the laptop's disk over the network. Set a root
+password on the live USB (`sudo passwd root`), find its address with
+`ip -br addr`, then on the other computer:
+
+```sh
+./scripts/install-over-ssh LAPTOP_IP --disk /dev/nvme0n1 --user me --wifi "MyHomeWifi"
+```
+
+`./scripts/install-over-ssh --help` lists all options.
 
 ---
 
@@ -266,7 +251,18 @@ doas sed -i "s|^me:[^:]*:|me:$HASH:|" /etc/shadow     # use root instead of me f
 
 Pull the latest tested pins, then rebuild and deploy. Use either option:
 
-**On the build machine, pushing to the laptop** (needs `--ssh-key` from step 4):
+**On the laptop itself** (in the copy step 4 made):
+
+```sh
+cd ~/sixos-laptop
+git pull
+nix-build -A hosts.laptop.configuration
+doas ./result/bin/deploy
+```
+
+**From another computer, pushing to the laptop** (needs `sshd = true` in
+`site/hosts/laptop.nix` and `--ssh-key ~/.ssh/id_ed25519.pub` given to the
+install command):
 
 ```sh
 cd ~/sixos-laptop
@@ -274,15 +270,6 @@ git pull
 nix-build -A hosts.laptop.configuration
 nix copy --no-check-sigs --to ssh://root@LAPTOP_IP ./result
 ssh root@LAPTOP_IP "$(readlink -f result)/bin/deploy"
-```
-
-**On the laptop itself** (using the copy from `--copy`):
-
-```sh
-cd ~/sixos-laptop
-git pull
-nix-build -A hosts.laptop.configuration
-doas ./result/bin/deploy
 ```
 
 `deploy` switches the running system to the new one, restarting only the
@@ -305,6 +292,20 @@ If you changed `site/hosts/laptop.nix`, commit it on your own branch, so
 ---
 
 ## Troubleshooting
+
+**`install-on-live-usb` stopped while building**
+Run the same command again with `--resume`; it keeps what was already
+downloaded. If the live USB itself runs out of memory before the disk is
+prepared (step 1 of the script), use a laptop with more RAM or the
+[over-ssh install](#alternative-install-from-another-computer-over-ssh).
+"--user ... does not match" means `--user` and `username` in
+`site/hosts/laptop.nix` differ.
+
+**`install-over-ssh`: "Permission denied" or "Connection refused"**
+Run `sudo passwd root` on the live USB (its root password starts out empty,
+and ssh refuses empty passwords). Check `LAPTOP_IP` with `ip -br addr` on the
+laptop, and that both machines are on the same network. If the install
+stopped halfway, just run the same command again: it starts over.
 
 **`nix-build` error: "host contains unknown top-level attrNames: ..."**
 A typo in `site/hosts/laptop.nix` or `nix/laptop.nix`. The allowed keys are in
@@ -379,7 +380,9 @@ that matters, set a GRUB password (`grub-mkpasswd-pbkdf2`, then
 | [`nix/laptop.nix`](nix/laptop.nix) | the system configuration: ly, mango, doas, PAM, kernel, services |
 | [`pins.json`](pins.json) | every upstream source, updated weekly |
 | [`patches/sixos/`](patches/sixos) | changes to upstream sixos (below) |
-| [`installer/sixos-install.sh`](installer/sixos-install.sh) | the installer from step 4 |
+| [`scripts/install-on-live-usb`](scripts/install-on-live-usb) | the install command from step 4 |
+| [`scripts/install-over-ssh`](scripts/install-over-ssh) | the same, run from another computer |
+| [`installer/sixos-install.sh`](installer/sixos-install.sh) | the part of it that runs on the laptop |
 | [`tests/`](tests) | the VM test; run it yourself with `nix-build tests -A all` |
 | [`scripts/update-pins.py`](scripts/update-pins.py) | what the weekly update runs |
 

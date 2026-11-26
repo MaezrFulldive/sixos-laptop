@@ -32,6 +32,11 @@
 
   # extra kernel command line parameters
 , kernel-params ? [ ]
+
+  # run sshd, so another machine can log in as root (with the key given to
+  # the installer's --ssh-key) and push updates.  Off by default: sixos's
+  # sshd service always compiles its own openssh.
+, sshd ? false
 }:
 
 host-final: host-prev:
@@ -88,7 +93,19 @@ infuse host-prev ([{
 
   pkgs.__assign = import sources.nixpkgs-path {
     localSystem = "x86_64-linux";
-    overlays = import (sources.sixos-path + "/pkgs/overlays.nix") { inherit lib infuse; };
+    overlays = import (sources.sixos-path + "/pkgs/overlays.nix") { inherit lib infuse; } ++ [
+      # sixos patches busybox (for its modprobe), and nix embeds a static
+      # busybox as its build sandbox's /bin/sh, so every nix would be
+      # recompiled.  The sandbox shell doesn't need the patch: with the
+      # unpatched one, nix comes prebuilt from cache.nixos.org.
+      (final: prev: {
+        busybox-sandbox-shell = (import sources.nixpkgs-path {
+          localSystem = "x86_64-linux";
+          config = { };
+          overlays = [ ];
+        }).busybox-sandbox-shell;
+      })
+    ];
   };
 
   # Everything in here ends up in $PATH (/run/current-system/sw/bin).  Its
@@ -131,8 +148,13 @@ infuse host-prev ([{
   ##########################################################################
 
   # Prebuilt kernel + firmware from nixpkgs-desktop: nothing to compile.
+  # The firmware is the zstd-compressed copy NixOS itself uses (0.9 GB instead
+  # of 2 GB; the kernel decompresses it).  It is on cache.nixos.org too,
+  # because the NixOS ISOs contain it.
   boot.kernel.package.__assign = desktop-pkgs.linuxPackages.kernel;
-  boot.kernel.firmware.__assign = [ desktop-pkgs.linux-firmware ];
+  boot.kernel.firmware.__assign = [
+    (desktop-pkgs.compressFirmwareZstd desktop-pkgs.linux-firmware)
+  ];
   boot.kernel.params.__append = [
     "firmware_class.path=/run/booted-system/firmware/lib/firmware"
   ] ++ kernel-params;
@@ -194,13 +216,6 @@ infuse host-prev ([{
     forward-queries-to = [ "9.9.9.9" "1.1.1.1" ];
   };
 
-  # sshd runs by default; allow key logins only, never passwords
-  targets.sshd.__assign = host-final.services.sshd {
-    extraConfig = ''
-      PasswordAuthentication no
-    '';
-  };
-
   # compressed swap in RAM
   targets.zram.__assign = host-final.services.zram { size-percent = 50; };
 
@@ -259,7 +274,21 @@ infuse host-prev ([{
     ];
   };
 
-}] ++ lib.optional (wifi != null) {
+}
+
+# sixos runs sshd by default.  With `sshd = true`, allow key logins only,
+# never passwords; otherwise leave it out.
+(if sshd then {
+  targets.sshd.__assign = host-final.services.sshd {
+    extraConfig = ''
+      PasswordAuthentication no
+    '';
+  };
+} else {
+  targets = t: builtins.removeAttrs t [ "sshd" ];
+})
+
+] ++ lib.optional (wifi != null) {
 
   targets.wifi.__assign = host-final.services.eiwd {
     ifname = "wlan0"; # the name sixos gives the interface

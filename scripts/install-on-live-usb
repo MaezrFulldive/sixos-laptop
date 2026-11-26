@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Install sixos on this laptop, entirely from the NixOS live USB it is
+# running.  No second computer is needed.
+#
+#   1. builds the installer (prebuilt from cache.nixos.org, nothing compiled)
+#   2. runs `sixos-install --phase prepare`: asks for the passwords, erases
+#      and partitions the disk, mounts it at /mnt, copies this repository to
+#      /mnt/home/USER/sixos-laptop
+#   3. builds the system straight into the new disk's /mnt/nix/store, so the
+#      downloads (about 1.8 GB) and the few small packages that are compiled
+#      go to the disk, not to the live USB's memory
+#   4. runs `sixos-install --phase finish`: boot profiles, GRUB, unmount
+#
+# If step 3 fails (e.g. the network dropped), fix the cause and run the same
+# command again with --resume: it keeps the disk and everything already
+# downloaded.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sudo scripts/install-on-live-usb --disk DEV --user NAME [options]
+
+  --disk DEV        the disk to ERASE, e.g. /dev/nvme0n1 (`lsblk -d`)
+  --user NAME       the `username` in site/hosts/laptop.nix
+
+Options:
+  --wifi SSID       Wi-Fi network for the installed system (asks for the
+                    passphrase)
+  --ssh-key FILE    public key allowed to log in as root over ssh; only
+                    useful with `sshd = true` in site/hosts/laptop.nix
+  --uid N           the user's uid, if you changed it (default 1000)
+  --resume          the disk was already prepared by an earlier run that
+                    stopped while building: skip erasing it and continue
+  --yes, --no-nvram passed on to sixos-install (see sixos-install --help)
+EOF
+}
+
+die() { echo "install-on-live-usb: $*" >&2; exit 1; }
+step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+MNT=/mnt
+
+DISK='' USERNAME='' USER_UID=1000 RESUME=''
+PASS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --disk) DISK=$2; shift 2 ;;
+    --user) USERNAME=$2; shift 2 ;;
+    --uid) USER_UID=$2; shift 2 ;;
+    --wifi) PASS+=(--wifi "$2"); shift 2 ;;
+    --ssh-key)
+      [ -f "$2" ] || die "--ssh-key: $2 does not exist"
+      PASS+=(--ssh-key "$(cat "$2")"); shift 2 ;;
+    --resume) RESUME=1; shift ;;
+    --yes|--no-nvram) PASS+=("$1"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+[ -n "$DISK" ] && [ -n "$USERNAME" ] || { usage >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run it as root: sudo $0 ..."
+[ -b "$DISK" ] || die "$DISK is not a block device (see \`lsblk -d\`)"
+command -v nix-build >/dev/null || die "no nix-build: boot the NixOS live USB"
+[ -d /sys/firmware/efi ] || echo "warning: not booted with UEFI; the laptop may not boot the installed system" >&2
+
+grep -q "username *= *\"$USERNAME\"" "$ROOT/site/hosts/laptop.nix" \
+  || die "--user $USERNAME does not match the username in site/hosts/laptop.nix"
+
+# ---------------------------------------------------------------------------
+step "Building the installer"
+# ---------------------------------------------------------------------------
+INSTALLER=$(nix-build "$ROOT" -A installer --no-out-link)
+echo "installer: $INSTALLER"
+
+if [ -z "$RESUME" ]; then
+  # -------------------------------------------------------------------------
+  step "Preparing $DISK"
+  # -------------------------------------------------------------------------
+  "$INSTALLER/bin/sixos-install" --phase prepare \
+    --disk "$DISK" --user "$USERNAME" --uid "$USER_UID" --copy "$ROOT" "${PASS[@]}"
+else
+  if ! mountpoint -q "$MNT" || ! mountpoint -q "$MNT/boot"; then
+    die "--resume: $MNT is not mounted (run without --resume to start over)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+step "Building the system into $MNT/nix/store"
+# ---------------------------------------------------------------------------
+# --store $MNT puts every download and build result on the new disk.  Build
+# directories and Nix's download cache go there too, not into the live USB's
+# memory.
+WORK=$MNT/nix/install-tmp
+mkdir -p "$WORK/build" "$WORK/cache"
+SYSTEM=$(TMPDIR=$WORK/build XDG_CACHE_HOME=$WORK/cache \
+  nix-build "$ROOT" -A hosts.laptop.configuration --store "$MNT" --no-out-link \
+  --option max-jobs auto --option cores 0) \
+  || die "the build failed; fix the cause, then run the same command again with --resume"
+[ -n "$SYSTEM" ] || die "the build printed no store path"
+echo "system: $SYSTEM"
+rm -rf "$WORK"
+
+# ---------------------------------------------------------------------------
+step "Installing GRUB and finishing"
+# ---------------------------------------------------------------------------
+"$INSTALLER/bin/sixos-install" --phase finish \
+  --disk "$DISK" --system "$SYSTEM" --user "$USERNAME" --uid "$USER_UID" "${PASS[@]}"
+
+step "Done"
+echo "Type \`reboot\` and remove the USB stick."

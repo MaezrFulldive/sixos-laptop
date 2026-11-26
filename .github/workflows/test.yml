@@ -55,5 +55,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: shellcheck installer/sixos-install.sh
-        run: shellcheck --shell=bash installer/sixos-install.sh
+      - name: shellcheck the install scripts
+        run: shellcheck --shell=bash installer/sixos-install.sh scripts/install-over-ssh scripts/install-on-live-usb
