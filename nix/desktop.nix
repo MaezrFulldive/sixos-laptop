@@ -36,6 +36,7 @@ let
     SSL_CERT_FILE = ca-file;
     NIX_SSL_CERT_FILE = ca-file;
     EDITOR = "vim";
+    TERMINAL = "foot";                      # for launchers starting terminal programs
   } // lib.optionalAttrs qutebrowser {
     BROWSER = "qutebrowser";
   };

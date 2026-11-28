@@ -24,6 +24,7 @@ p.add_argument("--user", required=True)
 p.add_argument("--uid", required=True)
 p.add_argument("--root-password", required=True)
 p.add_argument("--user-password", required=True)
+p.add_argument("--updated-system", required=True)
 args = p.parse_args()
 
 KVM = os.access("/dev/kvm", os.R_OK | os.W_OK)
@@ -259,10 +260,10 @@ check(f"grep -q '^{args.user}:x:' /etc/passwd", "/etc/passwd points at /etc/shad
 check("test ! -e /run/current-system/etc/shadow", "no password hashes in the Nix store")
 check(f"test \"$(stat -c %u /run/user/{args.uid})\" = {args.uid}", "/run/user/<uid> exists")
 check("grep -qx 'permit :wheel' /etc/doas.conf", "doas.conf requires a password")
-check(f"test \"$(stat -c %U /home/{args.user}/sixos-laptop/pins.json)\" = {args.user}",
-      "the repository was copied to the user's home")
-check(f"test ! -e /home/{args.user}/sixos-laptop/result && test ! -L /home/{args.user}/sixos-laptop/result",
-      "the repository copy has no result links")
+check("test \"$(stat -c %U /etc/sixos/pins.json)\" = root && test -f /etc/sixos/site/hosts/testvm.nix",
+      "the configuration was copied to /etc/sixos, owned by root")
+check("test ! -e /etc/sixos/result && test ! -L /etc/sixos/result",
+      "the configuration copy has no result links")
 check("grep -q ssh-ed25519 /root/.ssh/authorized_keys", "the --ssh-key was installed")
 check("ls /run/booted-system/firmware/lib/firmware/iwlwifi-*.zst | head -n 1 | grep -q zst",
       "the firmware is zstd-compressed")
@@ -317,6 +318,9 @@ logout()
 
 login(args.user, args.user_password)
 check("test \"$(id -un)\" = " + args.user, "user logged in with their password")
+check("! touch /etc/sixos/site/hosts/testvm.nix 2>/dev/null && ! touch /etc/sixos/new 2>/dev/null",
+      "the user can't change /etc/sixos without doas")
+check("git -C /etc/sixos status --short", "git works in /etc/sixos as the user (no 'dubious ownership')", soft=True)
 check("nmcli -t general permissions | grep -q '^org.freedesktop.NetworkManager.network-control:yes$'",
       "the user may change the network (nmtui) without doas", soft=True)
 check("test \"$SSL_CERT_FILE\" = /run/current-system/etc/ssl/certs/ca-certificates.crt && test \"$NIX_SSL_CERT_FILE\" = \"$SSL_CERT_FILE\"",
@@ -418,7 +422,25 @@ else:
           "the session has SSL_CERT_FILE")
 
 ###########################################################################
-# 5. poweroff powers off (sixos upstream turned it into a reboot)
+# 5. Switch to a changed configuration (one more program), as
+#    `sixos-rebuild switch` does after building it
+###########################################################################
+
+code, out = run(f"(timeout 240 {args.updated_system}/bin/deploy >/tmp/deploy2.log 2>&1; e=$?; tail -n 15 /tmp/deploy2.log; exit $e)", 300)
+if code != 0:
+    soft_fail(f"deploying the updated configuration failed:\n{out}")
+else:
+    print("\n### ok: deploying the updated configuration works", flush=True)
+check(f"test \"$(readlink -f /run/current-system)\" = {args.updated_system}",
+      "the running system is the updated one", soft=True)
+check("command -v hx && test -e /run/current-system/sw/share/applications/Helix.desktop",
+      "the added program (helix) is in PATH and in the launcher's .desktop files", soft=True)
+check(f"test \"$(readlink -f /nix/var/nix/profiles/nextboot)\" = {args.updated_system}",
+      "the updated configuration boots next time", soft=True)
+check("pidof mango", "the mango session survived the switch", soft=True)
+
+###########################################################################
+# 6. poweroff powers off (sixos upstream turned it into a reboot)
 ###########################################################################
 
 send("/run/init/bin/poweroff\n")

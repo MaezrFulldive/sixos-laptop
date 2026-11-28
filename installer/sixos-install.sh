@@ -34,7 +34,8 @@ Options:
                     and iwd's from older installs); everything else in / is
                     replaced
   --keep-passwords  with --keep: keep the passwords too, without asking
-  --copy DIR        copy DIR (e.g. this repo) into the new home directory
+  --copy DIR        copy DIR (this repository, the system's configuration)
+                    to /etc/sixos, owned by root
   --esp-size SIZE   size of the EFI partition (default 1GiB)
   --yes             don't ask before erasing the disk
   --no-nvram        don't add a firmware boot entry; only install GRUB at the
@@ -295,7 +296,7 @@ set -x
 chmod 600 "$MNT/etc/shadow"
 
 # /etc entries that follow the running configuration (and so every update)
-for d in pam.d mango fonts ssl nix; do
+for d in pam.d mango fonts ssl nix gitconfig; do
   ln -sfn "/run/current-system/etc/$d" "$MNT/etc/$d"
 done
 
@@ -343,15 +344,13 @@ echo "Wi-Fi networks:" "$NM_DIR"/*.nmconnection
 set -x
 
 if [ -n "$COPY_DIR" ]; then
-  dest=$MNT/home/$USERNAME/$(basename "$COPY_DIR")
-  if [ -e "$dest" ]; then   # --keep: an older copy
-    old=$dest.old-$(date +%Y%m%d-%H%M%S)
-    echo "moving the existing $(basename "$dest") aside to $(basename "$old")"
-    mv "$dest" "$old"
-  fi
-  cp -a "$COPY_DIR" "$dest"
-  rm -f "$dest"/result*
-  chown -R "$USER_UID:$USER_UID" "$dest"
+  # the configuration, like NixOS's /etc/nixos: readable by everyone,
+  # changed with doas
+  rm -rf "$MNT/etc/sixos"
+  cp -a "$COPY_DIR" "$MNT/etc/sixos"
+  rm -f "$MNT/etc/sixos"/result*
+  chown -R 0:0 "$MNT/etc/sixos"
+  chmod -R u+rwX,go+rX,go-w "$MNT/etc/sixos"
 fi
 chown "$USER_UID:$USER_UID" "$MNT/home/$USERNAME"
 

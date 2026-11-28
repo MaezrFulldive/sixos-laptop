@@ -13,7 +13,6 @@ with the result:
 The short version:
 
 ```sh
-cd ~/sixos-laptop
-vim site/hosts/laptop.nix                 # change something
+doas vim /etc/sixos/site/hosts/laptop.nix   # change something
 sixos-rebuild switch                      # build it, switch to it, boot it from now on
 ```

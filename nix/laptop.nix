@@ -106,25 +106,25 @@ let
   ];
 
   # `sixos-rebuild switch` and friends: build this machine's configuration
-  # from ~/sixos-laptop and switch to it (docs/configuring.md).
+  # from /etc/sixos and switch to it (docs/configuring.md).
   sixos-rebuild = desktop-pkgs.writeShellScriptBin "sixos-rebuild" ''
     set -eu
     usage() {
       cat <<'EOF'
     Usage: sixos-rebuild ACTION [--host NAME]
 
-    Builds this machine's configuration from $SIXOS_CONFIG (default
-    ~/sixos-laptop), then:
+    Builds this machine's configuration from /etc/sixos (or $SIXOS_CONFIG),
+    then:
 
-      switch        switch to it now, and boot it from now on    (result/bin/deploy)
-      boot          boot it from the next boot on                (result/bin/nextboot)
-      test          switch to it now, until the next reboot      (result/bin/activate)
-      build         nothing: just build it (./result)
+      switch        switch to it now, and boot it from now on
+      boot          boot it from the next boot on
+      test          switch to it now, until the next reboot
+      build         only build it (prints its store path)
       dry-activate  show which services would start, stop or restart
 
-    Run it as your user; it asks doas for the steps that need root.  If ly
-    changed, `switch` restarts it, which ends your mango session: use `boot`
-    and reboot instead.
+    Run it as your user: it builds as you and asks doas for the step that
+    needs root.  If ly changed, `switch` restarts it, which ends your mango
+    session: use `boot` and reboot instead.
     EOF
     }
     action=''${1:-}
@@ -149,13 +149,22 @@ let
       echo "sixos-rebuild: run it as your user, not with doas (it uses doas itself)" >&2
       exit 1
     fi
-    config=''${SIXOS_CONFIG:-$HOME/sixos-laptop}
-    cd "$config" || { echo "sixos-rebuild: no configuration in $config (set SIXOS_CONFIG)" >&2; exit 1; }
-    [ -f "site/hosts/$host.nix" ] || { echo "sixos-rebuild: there is no $config/site/hosts/$host.nix (use --host)" >&2; exit 1; }
-    echo "building hosts.$host.configuration in $config"
-    nix-build -A "hosts.$host.configuration" -o result
+    if [ -n "''${SIXOS_CONFIG:-}" ]; then
+      config=$SIXOS_CONFIG
+    elif [ -d /etc/sixos ]; then
+      config=/etc/sixos
+    else
+      config=$HOME/sixos-laptop   # installs from before /etc/sixos
+    fi
+    [ -f "$config/site/hosts/$host.nix" ] \
+      || { echo "sixos-rebuild: there is no $config/site/hosts/$host.nix (use --host, or set SIXOS_CONFIG)" >&2; exit 1; }
+    echo "building hosts.$host.configuration from $config"
+    # no ./result link: /etc/sixos belongs to root.  The boot and system
+    # profiles keep the result from being garbage collected.
+    system=$(nix-build "$config" -A "hosts.$host.configuration" --no-out-link)
+    echo "$system"
     if [ -n "$step" ]; then
-      exec doas ./result/bin/$step
+      exec doas "$system/bin/$step"
     fi
   '';
 
@@ -232,6 +241,11 @@ infuse host-prev ([{
     "etc/nix/nix.conf" = pkgs.writeText "nix.conf" ''
       build-users-group = _nixbld
       ssl-cert-file = ${ca-file}
+    '';
+    # git may read /etc/sixos (root's) as any user: `git log`, `git diff`
+    "etc/gitconfig" = pkgs.writeText "gitconfig" ''
+      [safe]
+      	directory = /etc/sixos
     '';
     "etc/ssl/certs/ca-certificates.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     "etc/ssl/certs/ca-bundle.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
@@ -349,13 +363,14 @@ infuse host-prev ([{
 
   # /etc/ssl -> /run/current-system/etc/ssl, for programs that look for
   # certificates there rather than in $SSL_CERT_FILE (e.g. anything run with
-  # doas, which clears the environment), and /etc/nix (nix.conf, above).
+  # doas, which clears the environment), /etc/nix (nix.conf) and
+  # /etc/gitconfig (above).
   # Systems installed before these existed get the links when this starts
   # (at boot, or when `deploy` switches to a system that has it).
   targets.etc-ssl.__assign = host-final.six.mkOneshot {
     up = pkgs.writeScript "etc-ssl-up" ''
       #!${pkgs.runtimeShell}
-      for d in ssl nix; do
+      for d in ssl nix gitconfig; do
         if [ ! -e /etc/$d ] && [ ! -L /etc/$d ]; then
           ${pkgs.busybox}/bin/ln -s /run/current-system/etc/$d /etc/$d || true
         fi

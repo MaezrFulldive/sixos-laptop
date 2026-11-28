@@ -466,6 +466,8 @@ echo "system: $SYSTEM"
 # ---------------------------------------------------------------------------
 step "Installing GRUB and finishing"
 # ---------------------------------------------------------------------------
+OLD_HOME_COPY=
+[ ! -d "$MNT/home/$USERNAME/sixos-laptop" ] || OLD_HOME_COPY=1
 cp "$LOG" "$MNT/home/$USERNAME/sixos-install.log"
 chown "$USER_UID:$USER_UID" "$MNT/home/$USERNAME/sixos-install.log"
 "$INSTALLER/bin/sixos-install" "${PASS[@]}" --phase finish --system "$SYSTEM"
@@ -473,8 +475,11 @@ chown "$USER_UID:$USER_UID" "$MNT/home/$USERNAME/sixos-install.log"
 step "Done"
 note "Remove the USB stick and reboot (\`reboot\`)."
 if [ "$DESKTOP" = true ]; then note "Log in on ly (tty1); a text console with a root login is on tty2."; fi
-note "Your configuration is ~/sixos-laptop: change site/hosts/$HOST.nix, then"
-note "run \`sixos-rebuild switch\` (docs/configuring.md).  Wi-Fi: \`nmtui\`."
+note "Your configuration is /etc/sixos: change site/hosts/$HOST.nix there (with"
+note "doas), then run \`sixos-rebuild switch\` (docs/configuring.md).  Wi-Fi: \`nmtui\`."
+if [ -n "$OLD_HOME_COPY" ]; then
+  note "(~/sixos-laptop, the configuration's old place, is still there; it isn't used any more)"
+fi
 note "The log of this install is ~/sixos-install.log."
 if [ "$MODE" = keep ]; then
   note "The earlier system's files are still in the Nix store; once the new one"

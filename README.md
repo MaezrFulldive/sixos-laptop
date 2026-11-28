@@ -143,7 +143,7 @@ and runs on its own:
    `sixos`), or, reusing it, cleans out everything but the Nix store,
    `/home` and `/root`
 2. writes `/etc/shadow`, the Wi-Fi networks and ssh host keys, and copies
-   this repository to `~/sixos-laptop` on the new disk
+   this repository to `/etc/sixos` on the new disk (owned by root)
 3. builds the system **directly into the disk's `/nix/store`**, so the
    downloads land on the disk, not in the live USB's memory
 4. copies the kernel and initrd to the ESP and installs GRUB (also at the
@@ -187,16 +187,20 @@ When it says it's done, type `reboot` and remove the USB stick.
 5. **tty2** (Ctrl+Alt+F2) has the boot log and a `login:` prompt for root.
    Without the desktop, that prompt is on tty1.
 
-**Your configuration** is the copy of this repository in **`~/sixos-laptop`**
-(there is no `/etc/nixos`). This machine's settings are in
-`~/sixos-laptop/site/hosts/<host>.nix`; after changing them:
+**Your configuration** is the copy of this repository in **`/etc/sixos`**,
+sixos's `/etc/nixos`. It belongs to root, so changing it takes `doas`.
+This machine's settings are in `/etc/sixos/site/hosts/<host>.nix`:
 
 ```sh
-sixos-rebuild switch          # build, switch to it, and boot it from now on
+doas vim /etc/sixos/site/hosts/laptop.nix     # change something
+sixos-rebuild switch          # build it, switch to it, and boot it from now on
 ```
 
-Commit your host file (`git add site/hosts; git commit`), so `git pull`
-merges the weekly updates into it.
+Programs you add appear in `PATH` (and in rofi) as soon as `switch` is done.
+Commit your changes, so `git pull` merges the weekly updates into them:
+`doas git -C /etc/sixos commit -am "my settings"` (the first time, give root
+a name for commits: `doas git config --global user.name me` and
+`doas git config --global user.email me@example.com`).
 
 Useful commands:
 
@@ -218,8 +222,7 @@ from NixOS (infusions instead of modules, s6 instead of systemd).
 Pull the latest tested pins, then rebuild:
 
 ```sh
-cd ~/sixos-laptop
-git pull
+doas git -C /etc/sixos pull
 sixos-rebuild switch
 ```
 
@@ -240,7 +243,7 @@ host file, and the other computer's key in the laptop's
 `/root/.ssh/authorized_keys`; the installer's `--ssh-key` puts it there):
 
 ```sh
-cd ~/sixos-laptop
+cd sixos-laptop               # a clone of this repository on that computer
 nix-build -A hosts.laptop.configuration
 nix copy --no-check-sigs --to ssh://root@LAPTOP_IP ./result
 ssh root@LAPTOP_IP "$(readlink -f result)/bin/deploy"

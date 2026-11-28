@@ -2,8 +2,10 @@
 
 ## Where things are
 
-The installer copied this repository to `~/sixos-laptop`. Everything about
-the system is in it:
+The installer copied this repository to `/etc/sixos` (like NixOS's
+`/etc/nixos`). Everything about the system is in it. It belongs to root:
+everyone can read it, changing it takes `doas` (`doas vim ...`,
+`doas git -C /etc/sixos ...`); `git log` and `git diff` work as you.
 
 | file | what's in it |
 | --- | --- |
@@ -15,19 +17,18 @@ the system is in it:
 | `pins.json` | which sixos and nixpkgs are used; updated weekly upstream |
 | `patches/sixos/` | the changes this setup makes to sixos |
 
-There is no `/etc/nixos`, no channel and no `nixos-rebuild`. The system is
-whatever `nix-build` builds from this directory.
+There is no channel and no `nixos-rebuild`. The system is whatever
+`nix-build` builds from this directory (`sixos-rebuild` does that for you).
 
 ## Change something, then switch to it
 
 ```sh
-cd ~/sixos-laptop
-vim site/hosts/laptop.nix
+doas vim /etc/sixos/site/hosts/laptop.nix
 sixos-rebuild switch
 ```
 
 `sixos-rebuild` builds the configuration of this machine (the host whose
-name the machine has) from `~/sixos-laptop`, as your user, then asks `doas`
+name the machine has) from `/etc/sixos`, as your user, then asks `doas`
 for the last step:
 
 | | does | the same by hand |
@@ -36,7 +37,7 @@ for the last step:
 | `boot` | boot it from the next boot on; the running system is untouched | `doas ./result/bin/nextboot` |
 | `test` | switch the running system only; a reboot goes back | `doas ./result/bin/activate` |
 | `dry-activate` | show which services would start, stop or restart | `doas ./result/bin/dry-activate` |
-| `build` | only build it, as `./result` | `nix-build -A hosts.laptop.configuration` |
+| `build` | only build it (prints its store path) | `nix-build /etc/sixos -A hosts.laptop.configuration` |
 
 If a change breaks booting, pick **"sixos (fallback)"** in GRUB: it is the
 system you booted before the last `switch`/`boot`.
@@ -54,11 +55,16 @@ Add them to `extra-packages` in `site/hosts/laptop.nix`:
 
 `pkgs` is a current NixOS release (`nixos-26.05`). Search names on
 <https://search.nixos.org/packages>. Programs end up in
-`/run/current-system/sw/bin`, on everyone's `PATH`.
+`/run/current-system/sw/bin`, on everyone's `PATH`, as soon as
+`sixos-rebuild switch` finishes, and in rofi if they have a `.desktop`
+file. **The command isn't always the package's name**: helix is `hx`,
+ripgrep is `rg`. To see what a package installed:
+`ls $(nix-build /etc/sixos -A sources.desktop-pkgs.helix --no-out-link)/bin`.
+Terminal programs (helix, htop) open in foot when started from rofi.
 
 `nix-shell -p something` works too, for trying a program without installing
 it. It uses this same nixpkgs only if you pass it:
-`nix-shell -I nixpkgs=$(nix-instantiate --eval -E '(import ./nix/sources.nix).nixpkgs-desktop-path' | tr -d '"') -p mpv`.
+`nix-shell -I nixpkgs=$(nix-instantiate --eval -E '(import /etc/sixos/nix/sources.nix).nixpkgs-desktop-path' | tr -d '"') -p mpv`.
 
 **Unfree programs** (Steam, Discord, NVIDIA drivers ...) are refused until
 you allow them. In `nix/sources.nix`, change the `desktop-pkgs` line
@@ -189,13 +195,12 @@ every `switch`.
 ## Updating
 
 ```sh
-cd ~/sixos-laptop
-git pull                                  # the latest tested sixos and nixpkgs
+doas git -C /etc/sixos pull               # the latest tested sixos and nixpkgs
 sixos-rebuild switch
 ```
 
-Keep your own changes committed (`git add site/hosts; git commit`), so
-`git pull` can merge the weekly updates into them.
+Keep your own changes committed (`doas git -C /etc/sixos commit -am "..."`),
+so `git pull` can merge the weekly updates into them.
 
 To free disk space: `doas nix-collect-garbage`. It never removes the
 current or the fallback system.

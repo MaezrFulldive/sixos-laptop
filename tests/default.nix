@@ -37,6 +37,8 @@ let
 
   host = repo.hosts.testvm;
   system = host.configuration;
+  # the same machine with one more program (tests/site/hosts/testvm-updated.nix)
+  updated-system = repo.hosts.testvm-updated.configuration;
   username = "tester";
 
   root-password = "sixosroot";
@@ -55,9 +57,9 @@ let
   install = vmTools.runInLinuxVM (pkgs.runCommand "sixos-test-install" {
     # what the NixOS live USB has
     nativeBuildInputs = with pkgs; [
-      nix openssl bash gnutar util-linux gawk gnused gnugrep coreutils findutils
+      nix openssl bash gnutar util-linux gawk gnused gnugrep coreutils findutils git
     ];
-    closure = pkgs.closureInfo { rootPaths = [ system repo.installer ]; };
+    closure = pkgs.closureInfo { rootPaths = [ system updated-system repo.installer ]; };
     memSize = 2048;
     preVM = ''
       mkdir -p $out
@@ -78,8 +80,20 @@ let
     mkdir -p $R/scripts $R/site/hosts
     cp ${../scripts/install-on-live-usb} $R/scripts/install-on-live-usb
     cp ${../pins.json} $R/pins.json
-    cp ${./site/hosts/testvm.nix} $R/site/hosts/testvm.nix
+    # a host file as the installer writes it (the system itself is the
+    # prebuilt tests/site/hosts/testvm.nix)
+    cat > $R/site/hosts/testvm.nix <<'EOF'
+    args@{ laptop-host, ... }:
+    laptop-host args {
+      username = "tester";
+      root-disk-modules = [ "nvme" ];
+      desktop = true;
+      qutebrowser = true;
+    }
+    EOF
     ln -s /nix/store/does-not-exist $R/result
+    git -C $R init -q && git -C $R add -A . && \
+      git -C $R -c user.name=test -c user.email=test@example.invalid commit -q -m stand-in
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDummyKeyForTheAutomatedTestOnly test" > $TMPDIR/key.pub
     common="--yes --disk /dev/vda --no-nvram --installer ${repo.installer} --system ${system}"
 
@@ -110,7 +124,9 @@ let
     test ! -e /mnt/etc/iwd
     grep -q '^psk=old-passphrase$' /mnt/etc/NetworkManager/system-connections/OldNet.nmconnection
     grep -q '^psk=test-passphrase$' /mnt/etc/NetworkManager/system-connections/TestNet.nmconnection
-    ls -d /mnt/home/${username}/sixos-laptop.old-*
+    test "$(stat -c %U /mnt/etc/sixos/pins.json)" = root
+    # for the boot test's `deploy` of an updated configuration
+    nix --extra-experimental-features nix-command copy --no-check-sigs --to /mnt ${updated-system}
     umount /mnt
     echo "### ok: the reinstall kept /home and the Wi-Fi networks"
   '');
@@ -147,12 +163,13 @@ let
       --user ${username} \
       --uid ${toString host.users.${username}.uid} \
       --root-password ${root-password} \
-      --user-password ${user-password}
+      --user-password ${user-password} \
+      --updated-system ${updated-system}
   '';
 
 in
 {
-  inherit install boot system generated-host;
+  inherit install boot system updated-system generated-host;
 
   # the real laptop configuration must evaluate and build too
   laptop = (import ../. { }).hosts.laptop.configuration;
