@@ -41,6 +41,14 @@ let
   sixos-path = desktop-pkgs.applyPatches {
     name = "sixos-patched";
     src = sixos-upstream;
+    # sixos fetches infuse with `ref = "v2.7"` (a tag).  The Nix on the
+    # installed system (2.18) takes a ref for a branch name, so git fails
+    # ("couldn't find remote ref refs/heads/v2.7", exit code 128).  Fetching
+    # all refs finds the pinned rev with any Nix version.
+    postPatch = ''
+      sed -i -E 's/^([[:space:]]*)ref = "v[^"]*";/\1allRefs = true;/' default.nix
+      grep -q 'allRefs = true;' default.nix
+    '';
     patches = map (name: patch-dir + "/${name}")
       (builtins.sort builtins.lessThan
         (builtins.filter (name: builtins.match ".*\\.patch" name != null)
