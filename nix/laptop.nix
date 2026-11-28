@@ -82,6 +82,11 @@ let
   # GTK/Qt programs expect it), starts `session-commands`, runs mango, and
   # stops those commands again when mango exits.
   dbus = desktop-pkgs.dbus;
+
+  # TLS certificates (Mozilla's list, as on NixOS).  Without them git, curl
+  # and nix can't use https.  They are in /run/current-system/etc/ssl, and
+  # /etc/ssl links there (the etc-ssl target below), so updates replace them.
+  ca-file = "/run/current-system/etc/ssl/certs/ca-certificates.crt";
   mango-session = desktop-pkgs.writeShellScript "mango-session" ''
     if [ -z "''${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
       exec ${dbus}/bin/dbus-run-session \
@@ -91,6 +96,8 @@ let
     # .desktop files (rofi -show drun), icons, D-Bus services ...  (ly sets
     # PATH from its own config but doesn't read /etc/profile)
     export XDG_DATA_DIRS=''${XDG_DATA_DIRS:-/run/current-system/sw/share}
+    export SSL_CERT_FILE=''${SSL_CERT_FILE:-${ca-file}}
+    export NIX_SSL_CERT_FILE=''${NIX_SSL_CERT_FILE:-${ca-file}}
     ${lib.concatMapStrings (cmd: "${cmd} &\n") session-commands}
     @out@/bin/mango "$@"
     status=$?
@@ -172,7 +179,7 @@ infuse host-prev ([{
   };
 
   # Files under /run/current-system/etc/.  The installer links /etc/pam.d,
-  # /etc/mango and /etc/fonts to them once; /etc/profile is linked
+  # /etc/mango, /etc/fonts and /etc/ssl to them once; /etc/profile is linked
   # automatically on first boot.
   extra-configuration-links.__assign = {
     "etc/pam.d" = pam-d;
@@ -181,7 +188,14 @@ infuse host-prev ([{
       export PATH=/run/six/bin:/run/current-system/sw/bin
       # .desktop files (rofi -show drun), icons, D-Bus services, man pages ...
       export XDG_DATA_DIRS=/run/current-system/sw/share
+      # https certificates, for git, curl, nix ...
+      export SSL_CERT_FILE=${ca-file}
+      export NIX_SSL_CERT_FILE=${ca-file}
     '';
+    "etc/ssl/certs/ca-certificates.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+    "etc/ssl/certs/ca-bundle.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+    # where nixpkgs' git/curl look when SSL_CERT_FILE isn't set (e.g. with doas)
+    "etc/ssl/cert.pem" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     "etc/mango/config.conf" = "${desktop-pkgs.mangowc.src}/assets/config.conf";
     "etc/fonts/fonts.conf" = desktop-pkgs.makeFontsConf {
       fontDirectories = with desktop-pkgs; [ dejavu_fonts noto-fonts ];
@@ -296,6 +310,26 @@ infuse host-prev ([{
       ${pkgs.busybox}/bin/chmod 4511 /run/wrappers/bin/.unix_chkpwd.tmp
       ${pkgs.busybox}/bin/mv -f /run/wrappers/bin/.unix_chkpwd.tmp /run/wrappers/bin/unix_chkpwd
     '';
+  };
+
+  # /etc/ssl -> /run/current-system/etc/ssl, for programs that look for
+  # certificates there rather than in $SSL_CERT_FILE (e.g. anything run with
+  # doas, which clears the environment).  Systems installed before this
+  # existed get the link on their next boot.
+  targets.etc-ssl.__assign = host-final.six.mkOneshot {
+    up = pkgs.writeScript "etc-ssl-up" ''
+      #!${pkgs.runtimeShell}
+      if [ ! -e /etc/ssl ] && [ ! -L /etc/ssl ]; then
+        ${pkgs.busybox}/bin/ln -s /run/current-system/etc/ssl /etc/ssl || true
+      fi
+    '';
+    passthru.after = [ host-final.targets.mounts."" ];
+  };
+
+  # The nix-daemon does the downloading for `nix-build` run as a user; it is
+  # started before /etc/ssl may exist, so tell it where the certificates are.
+  targets.nix-daemon.__assign = host-final.services.nix-daemon {
+    options.ssl-cert-file = ca-file;
   };
 
   # Login screen on tty1 (patches/sixos/0004-ly-service.patch)

@@ -150,6 +150,7 @@ Session programs log to `~/ly-session.log` (ly's session log), if anywhere.
 | **timers / cron** | none | a long-running loop (above) |
 | **journald** | per-service logs in `/var/log/<name>/`; `/dev/log` goes to the `syslog` service (`/var/log/syslog/`) | `s6-tai64nlocal < /var/log/NAME/current` |
 | **tmpfiles.d** | none | `mkdir = { ... };` in the service, or a oneshot |
+| **https certificates** (`/etc/ssl`, `SSL_CERT_FILE`) | Mozilla's list from `cacert`, in `/etc/ssl` and `$SSL_CERT_FILE`, as on NixOS | nothing |
 | **resolved** | `dnscache` on 127.0.0.1, `/etc/resolv.conf` points to it | nothing |
 | **NetworkManager** | **eiwd** for Wi-Fi, configured by files | [configuring.md](configuring.md#wi-fi). Wired Ethernet DHCP isn't set up yet. |
 | **`/usr/bin/foo`**, FHS paths | only `/bin/sh` and `/usr/bin/env` exist, as on NixOS | Same answers as on NixOS: `steam-run` or `buildFHSEnv` for prebuilt binaries, `appimage-run` for AppImages. |

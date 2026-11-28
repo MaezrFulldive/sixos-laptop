@@ -240,7 +240,7 @@ time.sleep(2)
 login("root", args.root_password, wait_for_prompt=False)
 check("test \"$(id -u)\" = 0", "root logged in with the root password")
 
-for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly", "earlyoom"]:
+for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly", "earlyoom", "etc-ssl", "nix-daemon"]:
     wait_until(f"s6-rc -a list | grep -qx '{svc}'", f"service {svc} is up", 120)
 wait_until("pidof ly", "ly is running", 60)
 
@@ -256,6 +256,14 @@ check(f"test ! -e /home/{args.user}/sixos-laptop/result && test ! -L /home/{args
 check("grep -q ssh-ed25519 /root/.ssh/authorized_keys", "the --ssh-key was installed")
 check("ls /run/booted-system/firmware/lib/firmware/iwlwifi-*.zst | head -n 1 | grep -q zst",
       "the firmware is zstd-compressed")
+check("grep -q 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt && grep -q 'BEGIN CERTIFICATE' /etc/ssl/cert.pem",
+      "/etc/ssl has the https certificates")
+check("tr '\\0' ' ' < /proc/$(pidof nix-daemon | cut -d' ' -f1)/cmdline | grep -q 'ssl-cert-file /run/current-system/etc/ssl/certs/ca-certificates.crt'",
+      "the nix-daemon knows where the certificates are")
+# a system installed before /etc/ssl existed gets it from the etc-ssl target
+run("rm /etc/ssl && s6-rc -d change etc-ssl && s6-rc -u change etc-ssl", 30)
+check("test \"$(readlink /etc/ssl)\" = /run/current-system/etc/ssl",
+      "the etc-ssl target creates a missing /etc/ssl")
 for c in DIAGNOSTICS:     # recorded in the log, useful when a later step fails
     run(c, 30)
 logout()
@@ -266,6 +274,12 @@ logout()
 
 login(args.user, args.user_password)
 check("test \"$(id -un)\" = " + args.user, "user logged in with their password")
+check("test \"$SSL_CERT_FILE\" = /run/current-system/etc/ssl/certs/ca-certificates.crt && test \"$NIX_SSL_CERT_FILE\" = \"$SSL_CERT_FILE\"",
+      "the login shell has SSL_CERT_FILE and NIX_SSL_CERT_FILE")
+# what `nix-build -A hosts.laptop.configuration` relies on: the user builds
+# through the nix-daemon (the store belongs to root)
+check("nix-build --no-out-link --option substitute false -E 'derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo ok > $out\" ]; }' | grep -q '^/nix/store/.*-t$'",
+      "the user can nix-build (through the nix-daemon)", 180)
 code, out = run("doas -n true")
 if code == 0:
     fail("doas ran without asking for a password")
@@ -325,6 +339,8 @@ else:
           "session-commands started pipewire as the user")
     check("tr '\\0' '\\n' < /proc/$(pidof mango | cut -d' ' -f1)/environ | grep -qx 'XDG_DATA_DIRS=/run/current-system/sw/share'",
           "the session has XDG_DATA_DIRS")
+    check("tr '\\0' '\\n' < /proc/$(pidof mango | cut -d' ' -f1)/environ | grep -qx 'SSL_CERT_FILE=/run/current-system/etc/ssl/certs/ca-certificates.crt'",
+          "the session has SSL_CERT_FILE")
 
 ###########################################################################
 # 5. poweroff powers off (sixos upstream turned it into a reboot)

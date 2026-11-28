@@ -245,6 +245,12 @@ HASH=$(mkpasswd -m sha512)                            # asks for the new passwor
 doas sed -i "s|^me:[^:]*:|me:$HASH:|" /etc/shadow     # use root instead of me for root
 ```
 
+**Your configuration** is the copy of this repository the installer put in
+**`~/sixos-laptop`** (there is no `/etc/nixos`). This machine's settings are
+in `~/sixos-laptop/site/hosts/laptop.nix`; after changing it, run
+`nix-build -A hosts.laptop.configuration && doas ./result/bin/deploy` in
+`~/sixos-laptop`.
+
 **Next: [docs/](docs/README.md)** explains how to configure and use the
 system: adding programs, sound, services, several machines, and how sixos
 differs from NixOS (infusions instead of modules, s6 instead of systemd).
@@ -296,6 +302,33 @@ If you changed `site/hosts/laptop.nix`, commit it on your own branch, so
 ---
 
 ## Troubleshooting
+
+**`git pull` or `nix-build` fails with "SSL certificate problem" or "SSL connect error"**
+Systems installed before this was fixed have no https certificates, so the
+fix can't be downloaded either. Bring the certificate file over once from
+another computer on the same network (any Linux machine has it):
+
+```sh
+# on the other computer: serve the file, and note its checksum and IP address
+cd /etc/ssl/certs && sha256sum ca-certificates.crt && ip -4 addr
+python3 -m http.server 8000                  # Ctrl+C when the laptop has it
+```
+
+```sh
+# on the laptop
+doas mkdir -p /etc/ssl/certs
+doas wget -O /etc/ssl/certs/ca-certificates.crt http://OTHER_IP:8000/ca-certificates.crt
+sha256sum /etc/ssl/certs/ca-certificates.crt     # must match the other computer
+doas s6-svc -r /run/service/nix-daemon           # it reads the file when it starts
+cd ~/sixos-laptop
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt git pull
+nix-build -A hosts.laptop.configuration
+doas ./result/bin/nextboot
+doas rm -r /etc/ssl              # the new system links its own /etc/ssl at boot
+doas /run/init/bin/reboot
+```
+
+After the reboot, https works for git, nix and everything else.
 
 **`install-on-live-usb` stopped while building**
 Run the same command again with `--resume`; it keeps what was already
