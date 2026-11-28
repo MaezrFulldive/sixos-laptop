@@ -1,9 +1,11 @@
-# The sixos host configuration for a laptop with ly + mango.
+# The sixos host configuration shared by every machine in site/hosts/:
+# networking (NetworkManager), the tools to repair a system from its own
+# console, and optionally the desktop (ly + mango, nix/desktop.nix).
 #
-# site/hosts/laptop.nix calls this with the settings that differ from laptop
-# to laptop (user name, disk driver, Wi-Fi card).  The automated test calls it
-# with settings for a QEMU virtual machine (tests/site/hosts/testvm.nix), so
-# the test boots exactly this configuration.
+# site/hosts/<name>.nix calls this with the settings that differ from machine
+# to machine (user name, disk driver, desktop or not).  The automated test
+# calls it with settings for a QEMU virtual machine
+# (tests/site/hosts/testvm.nix), so the test boots exactly this configuration.
 
 # arguments sixos passes to every file in site/
 { lib, infuse, sources, ... }:
@@ -16,13 +18,20 @@
   # "nvme" for NVMe disks, "ahci" for SATA
 , root-disk-modules ? [ "nvme" ]
 
-  # the console that shows kernel messages and the rescue `login:` prompt.
-  # tty1 is used by ly.
-, console ? { device = "tty2"; }
+  # ly + mango and the desktop programs (nix/desktop.nix).  Without it the
+  # machine boots to a text login on tty1.
+, desktop ? true
 
-  # { module = "iwlwifi"; sysfs = "/sys/devices/pci0000:00/0000:00:14.3"; }
-  # or null for no Wi-Fi
-, wifi ? null
+  # qutebrowser, with mpv + yt-dlp for videos, GStreamer, spell checking and
+  # its PDF viewer (needs desktop)
+, qutebrowser ? false
+
+  # the console that shows kernel messages and the rescue `login:` prompt
+  # (tty2 with the desktop, because tty1 is ly's)
+, console ? { device = if desktop then "tty2" else "tty1"; }
+
+  # extra NetworkManager.conf settings, e.g. { main.dns = "none"; }
+, networkmanager-settings ? { }
 
   # extra programs from nixpkgs-desktop, e.g. `pkgs: [ pkgs.firefox ]`
 , extra-packages ? (pkgs: [ ])
@@ -41,8 +50,8 @@
   # Programs started in the background when you log in through ly, and
   # stopped when mango exits: this setup's replacement for systemd user
   # services.  They run as you, inside the session's D-Bus bus, e.g.
-  #   [ "pipewire" "wireplumber" "pipewire-pulse" ]
-  # (the programs themselves go in extra-packages).
+  #   [ "mako" "waybar" ]
+  # (the programs themselves go in extra-packages; sound is always started).
 , session-commands ? [ ]
 
   # More configuration for this one machine, as infusions on the host (see
@@ -68,58 +77,87 @@ let
     password required ${linux-pam}/lib/security/pam_unix.so sha512
     session  required ${linux-pam}/lib/security/pam_unix.so
   '';
-  # sixos has no udevd (it uses mdevd), and nixpkgs' libinput/wlroots are
-  # linked against systemd's libudev, which only reports devices that udevd
-  # has processed, so mango would find no keyboard or mouse.  libudev-zero is
-  # a drop-in libudev for exactly this situation (mdevd runs with `-O 4` to
-  # rebroadcast hotplug events for it).  LD_LIBRARY_PATH overrides the
-  # libraries' RUNPATH, so no rebuild is needed; programs started from mango
-  # inherit it.
-  #
-  # ly starts the session's `Exec=` command, which is changed from `mango` to
-  # `mango-session`: it gives the session a D-Bus session bus (there is no
-  # systemd/logind to provide one; portals, notifications, pipewire and many
-  # GTK/Qt programs expect it), starts `session-commands`, runs mango, and
-  # stops those commands again when mango exits.
-  dbus = desktop-pkgs.dbus;
-
   # TLS certificates (Mozilla's list, as on NixOS).  Without them git, curl
   # and nix can't use https.  They are in /run/current-system/etc/ssl, and
   # /etc/ssl links there (the etc-ssl target below), so updates replace them.
   ca-file = "/run/current-system/etc/ssl/certs/ca-certificates.crt";
-  mango-session = desktop-pkgs.writeShellScript "mango-session" ''
-    if [ -z "''${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-      exec ${dbus}/bin/dbus-run-session \
-        --dbus-daemon=${dbus}/bin/dbus-daemon \
-        --config-file=${dbus}/share/dbus-1/session.conf -- "$0" "$@"
-    fi
-    # .desktop files (rofi -show drun), icons, D-Bus services ...  (ly sets
-    # PATH from its own config but doesn't read /etc/profile)
-    export XDG_DATA_DIRS=''${XDG_DATA_DIRS:-/run/current-system/sw/share}
-    export SSL_CERT_FILE=''${SSL_CERT_FILE:-${ca-file}}
-    export NIX_SSL_CERT_FILE=''${NIX_SSL_CERT_FILE:-${ca-file}}
-    ${lib.concatMapStrings (cmd: "${cmd} &\n") session-commands}
-    @out@/bin/mango "$@"
-    status=$?
-    # shellcheck disable=SC2046
-    kill $(jobs -p) 2>/dev/null
-    exit $status
-  '';
-  mango = desktop-pkgs.symlinkJoin {
-    name = "mango-with-libudev-zero";
-    paths = [ desktop-pkgs.mangowc ];
-    nativeBuildInputs = [ desktop-pkgs.makeWrapper ];
-    postBuild = ''
-      wrapProgram $out/bin/mango \
-        --prefix LD_LIBRARY_PATH : ${desktop-pkgs.libudev-zero}/lib
-      substitute ${mango-session} $out/bin/mango-session --subst-var out
-      chmod +x $out/bin/mango-session
-      for f in $out/share/wayland-sessions/*.desktop; do
-        sed 's|^Exec=mango$|Exec=mango-session|' "$(readlink -f "$f")" > "$f.new"
-        mv "$f.new" "$f"
-      done
-    '';
+
+  desktop-cfg = import ./desktop.nix {
+    inherit lib desktop-pkgs ca-file session-commands qutebrowser;
   };
+
+  # D-Bus policies for the system bus (who may own and call which names)
+  networkmanager = desktop-pkgs.networkmanager;
+  wpa_supplicant = desktop-pkgs.wpa_supplicant;
+
+  # Enough to repair or reinstall the system from its own console, with no
+  # second computer: network (nmtui), editors, git, disks, a text browser.
+  # These come before busybox in $PATH, so they win over its smaller
+  # versions of the same commands.
+  tools-before-busybox = with desktop-pkgs; [ vim less iproute2 wget procps ];
+  rescue-tools = with desktop-pkgs; [
+    networkmanager wpa_supplicant iw      # nmtui, nmcli, wpa_cli, iw
+    git curl openssh rsync                # ssh/scp (the client only)
+    nano htop tmux file tree jq ripgrep ncdu lsof
+    w3m                                   # a text web browser (captive portals, docs)
+    util-linux e2fsprogs dosfstools gptfdisk parted efibootmgr   # disks and boot
+    pciutils usbutils                     # lspci, lsusb
+    unzip zip xz zstd
+  ];
+
+  # `sixos-rebuild switch` and friends: build this machine's configuration
+  # from ~/sixos-laptop and switch to it (docs/configuring.md).
+  sixos-rebuild = desktop-pkgs.writeShellScriptBin "sixos-rebuild" ''
+    set -eu
+    usage() {
+      cat <<'EOF'
+    Usage: sixos-rebuild ACTION [--host NAME]
+
+    Builds this machine's configuration from $SIXOS_CONFIG (default
+    ~/sixos-laptop), then:
+
+      switch        switch to it now, and boot it from now on    (result/bin/deploy)
+      boot          boot it from the next boot on                (result/bin/nextboot)
+      test          switch to it now, until the next reboot      (result/bin/activate)
+      build         nothing: just build it (./result)
+      dry-activate  show which services would start, stop or restart
+
+    Run it as your user; it asks doas for the steps that need root.  If ly
+    changed, `switch` restarts it, which ends your mango session: use `boot`
+    and reboot instead.
+    EOF
+    }
+    action=''${1:-}
+    [ $# -gt 0 ] && shift
+    host=$(cat /proc/sys/kernel/hostname)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --host) host=$2; shift 2 ;;
+        *) usage >&2; exit 1 ;;
+      esac
+    done
+    case "$action" in
+      switch) step=deploy ;;
+      boot) step=nextboot ;;
+      test) step=activate ;;
+      dry-activate) step=dry-activate ;;
+      build) step= ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) usage >&2; exit 1 ;;
+    esac
+    if [ "$(id -u)" = 0 ]; then
+      echo "sixos-rebuild: run it as your user, not with doas (it uses doas itself)" >&2
+      exit 1
+    fi
+    config=''${SIXOS_CONFIG:-$HOME/sixos-laptop}
+    cd "$config" || { echo "sixos-rebuild: no configuration in $config (set SIXOS_CONFIG)" >&2; exit 1; }
+    [ -f "site/hosts/$host.nix" ] || { echo "sixos-rebuild: there is no $config/site/hosts/$host.nix (use --host)" >&2; exit 1; }
+    echo "building hosts.$host.configuration in $config"
+    nix-build -A "hosts.$host.configuration" -o result
+    if [ -n "$step" ]; then
+      exec doas ./result/bin/$step
+    fi
+  '';
 
   pam-d = pkgs.linkFarm "pam.d" {
     ly = pkgs.writeText "pam-ly" (pam-unix-service desktop-pkgs.linux-pam);
@@ -165,16 +203,12 @@ infuse host-prev ([{
     name = "laptop-sw";
     ignoreCollisions = true; # e.g. busybox and bash both provide bin/sh; first one wins
     paths =
+      tools-before-busybox
       # required by sixos itself
-      (with pkgs; [ busybox s6 s6-rc doas nix bashInteractive ])
-      # desktop
-      ++ [ mango ]
-      ++ (with desktop-pkgs; [
-        foot   # terminal   (mango default: Alt+Return)
-        rofi   # launcher   (mango default: Alt+Space)
-        mesa   # GPU drivers
-        git
-      ])
+      ++ (with pkgs; [ busybox s6 s6-rc doas nix bashInteractive ])
+      ++ [ sixos-rebuild ]
+      ++ rescue-tools
+      ++ lib.optionals desktop desktop-cfg.packages
       ++ extra-packages desktop-pkgs;
   };
 
@@ -191,15 +225,18 @@ infuse host-prev ([{
       # https certificates, for git, curl, nix ...
       export SSL_CERT_FILE=${ca-file}
       export NIX_SSL_CERT_FILE=${ca-file}
+      export EDITOR=vim PAGER=less
     '';
     "etc/ssl/certs/ca-certificates.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     "etc/ssl/certs/ca-bundle.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     # where nixpkgs' git/curl look when SSL_CERT_FILE isn't set (e.g. with doas)
     "etc/ssl/cert.pem" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-    "etc/mango/config.conf" = "${desktop-pkgs.mangowc.src}/assets/config.conf";
     "etc/fonts/fonts.conf" = desktop-pkgs.makeFontsConf {
-      fontDirectories = with desktop-pkgs; [ dejavu_fonts noto-fonts ];
+      fontDirectories = with desktop-pkgs; [ dejavu_fonts noto-fonts noto-fonts-color-emoji ];
     };
+  } // lib.optionalAttrs desktop {
+    "etc/mango/config.conf" = desktop-cfg.mango-config;
+    "etc/mango/sixos.conf" = desktop-cfg.sixos-conf;
   };
 
   ##########################################################################
@@ -269,33 +306,25 @@ infuse host-prev ([{
   # Services (each target is started at boot)
   ##########################################################################
 
-  # DNS: a local caching resolver on 127.0.0.1.  It must be told where to
-  # forward queries, otherwise evaluation fails.
-  targets.dnscache.__assign = host-final.services.dnscache {
-    forward-queries-to = [ "9.9.9.9" "1.1.1.1" ];
+  # Network: NetworkManager (`nmtui`), for Wi-Fi and wired networks, DHCP
+  # and /etc/resolv.conf.  It and wpa_supplicant talk over the D-Bus system
+  # bus.  (by-name/ne/networkmanager, by-name/wp/wpa-supplicant,
+  # by-name/db/dbus-system)
+  targets.dbus.__assign = host-final.services.dbus-system {
+    packages = [ networkmanager wpa_supplicant ];
+  };
+  targets.wpa-supplicant.__assign = host-final.services.wpa-supplicant {
+    package = wpa_supplicant;
+    after = [ host-final.targets.dbus ];
+  };
+  targets.networkmanager.__assign = host-final.services.networkmanager {
+    package = networkmanager;
+    settings = networkmanager-settings;
+    after = [ host-final.targets.dbus host-final.targets.wpa-supplicant ];
   };
 
   # compressed swap in RAM
   targets.zram.__assign = host-final.services.zram { size-percent = 50; };
-
-  # Seat management, so mango can use the GPU and input devices without
-  # running as root.  Any member of _video may take the seat.
-  targets.seatd.__assign = host-final.services.seatd {
-    user = "root";
-    group = "_video";
-  };
-
-  # ly sets XDG_RUNTIME_DIR=/run/user/<uid> but doesn't create it (on other
-  # distros logind does that), so create it at boot.
-  targets.run-user.__assign = host-final.six.mkOneshot {
-    up = pkgs.writeScript "run-user-up" ''
-      #!${pkgs.runtimeShell} -e
-      ${pkgs.busybox}/bin/mkdir -p /run/user
-      ${pkgs.busybox}/bin/mkdir -p -m 0700 /run/user/${toString uid}
-      ${pkgs.busybox}/bin/chown ${toString uid}:${toString uid} /run/user/${toString uid}
-    '';
-    passthru.after = [ host-final.targets.mounts."" ];
-  };
 
   # pam_unix checks the password of a *non-root* caller (e.g. a user running
   # doas, or a screen locker) with the setuid helper `unix_chkpwd`, which
@@ -332,6 +361,45 @@ infuse host-prev ([{
     options.ssl-cert-file = ca-file;
   };
 
+}
+
+# sixos runs a local DNS cache by default; here NetworkManager writes the
+# DNS servers each network hands out to /etc/resolv.conf instead.
+{ targets = t: builtins.removeAttrs t [ "dnscache" ]; }
+
+# sixos runs sshd by default.  With `sshd = true`, allow key logins only,
+# never passwords; otherwise leave it out.
+(if sshd then {
+  targets.sshd.__assign = host-final.services.sshd {
+    extraConfig = ''
+      PasswordAuthentication no
+    '';
+  };
+} else {
+  targets = t: builtins.removeAttrs t [ "sshd" ];
+})
+
+] ++ lib.optional desktop {
+
+  # Seat management, so mango can use the GPU and input devices without
+  # running as root.  Any member of _video may take the seat.
+  targets.seatd.__assign = host-final.services.seatd {
+    user = "root";
+    group = "_video";
+  };
+
+  # ly sets XDG_RUNTIME_DIR=/run/user/<uid> but doesn't create it (on other
+  # distros logind does that), so create it at boot.
+  targets.run-user.__assign = host-final.six.mkOneshot {
+    up = pkgs.writeScript "run-user-up" ''
+      #!${pkgs.runtimeShell} -e
+      ${pkgs.busybox}/bin/mkdir -p /run/user
+      ${pkgs.busybox}/bin/mkdir -p -m 0700 /run/user/${toString uid}
+      ${pkgs.busybox}/bin/chown ${toString uid}:${toString uid} /run/user/${toString uid}
+    '';
+    passthru.after = [ host-final.targets.mounts."" ];
+  };
+
   # Login screen on tty1 (patches/sixos/0004-ly-service.patch)
   targets.ly.__assign = host-final.services.ly-dm {
     package = desktop-pkgs.ly;
@@ -353,29 +421,36 @@ infuse host-prev ([{
     ];
   };
 
-}
-
-# sixos runs sshd by default.  With `sshd = true`, allow key logins only,
-# never passwords; otherwise leave it out.
-(if sshd then {
-  targets.sshd.__assign = host-final.services.sshd {
-    extraConfig = ''
-      PasswordAuthentication no
+  # nixpkgs' gnome-keyring starts (over D-Bus) the NixOS path
+  # /run/wrappers/bin/gnome-keyring-daemon; NixOS puts a wrapper there that
+  # may lock memory.  A plain link is enough: without that capability the
+  # keyring just can't keep secrets out of swap (zram here, so in RAM anyway).
+  targets.keyring-wrapper.__assign = host-final.six.mkOneshot {
+    up = pkgs.writeScript "keyring-wrapper-up" ''
+      #!${pkgs.runtimeShell}
+      ${pkgs.busybox}/bin/mkdir -p /run/wrappers/bin
+      ${pkgs.busybox}/bin/ln -sfn ${desktop-pkgs.gnome-keyring}/bin/gnome-keyring-daemon /run/wrappers/bin/gnome-keyring-daemon
+      true
     '';
   };
-} else {
-  targets = t: builtins.removeAttrs t [ "sshd" ];
-})
 
-] ++ lib.optional (wifi != null) {
-
-  targets.wifi.__assign = host-final.services.eiwd {
-    ifname = "wlan0"; # the name sixos gives the interface
-    phyname = "phy-wifi";
-    modules = [ wifi.module ];
-    sysfs-base-glob = wifi.sysfs;
-    state_directory = "/etc/iwd/networks";
-    conf_directory = "/etc/iwd";
+  # Let members of _video change the screen brightness (brightnessctl, the
+  # brightness keys); on other distributions udev rules do this.
+  targets.backlight.__assign = host-final.six.mkOneshot {
+    up = pkgs.writeScript "backlight-up" ''
+      #!${pkgs.runtimeShell}
+      # the GPU driver may create the backlight a little after boot
+      for _ in $(${pkgs.busybox}/bin/seq 100); do
+        [ -e /sys/class/backlight ] && [ -n "$(${pkgs.busybox}/bin/ls /sys/class/backlight)" ] && break
+        ${pkgs.busybox}/bin/sleep 0.1
+      done
+      for f in /sys/class/backlight/*/brightness; do
+        [ -e "$f" ] || continue
+        ${pkgs.busybox}/bin/chgrp _video "$f" && ${pkgs.busybox}/bin/chmod g+w "$f"
+      done
+      true
+    '';
+    passthru.after = [ host-final.targets.global.coldplug ];
   };
 
 }

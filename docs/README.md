@@ -14,7 +14,6 @@ The short version:
 
 ```sh
 cd ~/sixos-laptop
-vi site/hosts/laptop.nix                  # change something
-nix-build -A hosts.laptop.configuration   # build it (as your user)
-doas ./result/bin/deploy                  # switch to it now, and boot it next time
+vim site/hosts/laptop.nix                 # change something
+sixos-rebuild switch                      # build it, switch to it, boot it from now on
 ```

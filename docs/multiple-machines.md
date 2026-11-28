@@ -25,25 +25,23 @@ args@{ laptop-host, ... }:
 
 laptop-host args {
   username = "me";
-  root-disk-modules = [ "ahci" ];     # SATA disk
-  wifi = null;                        # no Wi-Fi card
+  root-disk-modules = [ "ahci" "sd_mod" ];   # SATA disk
+  desktop = true;
   extra-packages = pkgs: with pkgs; [ firefox ];
 }
 ```
 
-`laptop-host` is `nix/laptop.nix`: ly, mango, doas, the kernel and the base
-services, with the per-machine settings as arguments (they're listed and
-explained at the top of that file). Despite the name, nothing in it is
-laptop-only.
+`laptop-host` is `nix/laptop.nix`: network, doas, the kernel, the base
+services and (with `desktop = true`) ly and mango, with the per-machine
+settings as arguments (they're listed and explained at the top of that
+file). Despite the name, nothing in it is laptop-only. A server is
+`desktop = false`.
 
-Install it from the live USB on that machine, naming the host:
+Or let the installer write the file: run it on the new machine's live USB
+and answer `desktop` to the host-name question (or pass `--host desktop`).
 
-```sh
-sudo ./scripts/install-on-live-usb --host desktop --disk /dev/sda --user me
-```
-
-Later updates work as on the laptop, with `hosts.desktop` instead of
-`hosts.laptop`.
+Later updates work as on the laptop: `sixos-rebuild switch` builds the
+configuration named after the machine's host name.
 
 ## Machine-specific extras: `extra-config`
 

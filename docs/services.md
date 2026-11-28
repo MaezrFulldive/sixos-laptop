@@ -4,7 +4,7 @@ Most programs don't care about the init system. The ones that do usually
 want one of these:
 
 - to be started at boot and kept running: write a service (below)
-- to run while you're logged in (sound, notifications, a bar): `session-commands`
+- to run while you're logged in (notifications, a bar): `session-commands`
 - something systemd normally provides (logind, udev, D-Bus, a user
   manager, timers): see [the table](#what-systemd-would-have-provided)
 
@@ -117,18 +117,21 @@ in go in `session-commands` in `site/hosts/<machine>.nix`; the programs
 themselves go in `extra-packages`:
 
 ```nix
-  extra-packages = pkgs: with pkgs; [ pipewire wireplumber mako waybar ];
-  session-commands = [ "pipewire" "wireplumber" "pipewire-pulse" "mako" "waybar" ];
+  extra-packages = pkgs: with pkgs; [ mako waybar ];
+  session-commands = [ "mako" "waybar" ];
 ```
 
-When you log in, ly starts `mango-session` (in `nix/laptop.nix`), which:
+When you log in, ly starts `mango-session` (in `nix/desktop.nix`), which:
 
-1. starts a **D-Bus session bus** (`dbus-run-session`), so
-   `DBUS_SESSION_BUS_ADDRESS` is set for everything in the session
-2. sets `XDG_DATA_DIRS` (so launchers find `.desktop` files and icons)
-3. starts each `session-commands` entry in the background, as you
-4. runs mango
-5. stops the `session-commands` programs when mango exits
+1. sets the session's environment (`XDG_DATA_DIRS`, so launchers find
+   `.desktop` files and icons; `XDG_CURRENT_DESKTOP`, for the portals; ...)
+2. starts a **D-Bus session bus** (`dbus-run-session`), so
+   `DBUS_SESSION_BUS_ADDRESS` is set for everything in the session, and
+   portals and the keyring can start on demand
+3. starts sound: PipeWire, then WirePlumber and pipewire-pulse
+4. starts each `session-commands` entry in the background, as you
+5. runs mango
+6. stops all of them when mango exits
 
 mango's own `exec-once=` lines in `~/.config/mango/config.conf` work too,
 for things that belong to mango (wallpaper, mango-specific tools). They
@@ -144,15 +147,15 @@ Session programs log to `~/ly-session.log` (ly's session log), if anywhere.
 | **`/run/user/<uid>`** | created at boot by the `run-user` target; ly sets `XDG_RUNTIME_DIR` | nothing |
 | **udev** (`libudev`) | **mdevd**, plus **libudev-zero** put first via `LD_LIBRARY_PATH` | Everything started from mango inherits it. A *service* that enumerates devices (input, game controllers) needs `env.LD_LIBRARY_PATH = "${desktop-pkgs.libudev-zero}/lib";`. udev *rules* files don't apply; device permissions come from sixos's mdevd config (`_video`, `_input`, `_audio` groups). |
 | **D-Bus session bus** | started for each session by `mango-session` | nothing |
-| **D-Bus system bus** | none | Programs that need it (NetworkManager, bluez/Bluetooth, upower, udisks, flatpak's system helper) need a system `dbus-daemon` service first. Not set up yet; it's a `mkFunnel` running `dbus-daemon --system --nofork`, plus their own service. |
-| **polkit** | none | `doas` |
+| **D-Bus system bus** | the `dbus` service ([`by-name/db/dbus-system`](../by-name/db/dbus-system/service.nix)), without bus activation | A program that offers a system service (bluez, upower, udisks) needs: its package in the bus's `packages` (that loads its D-Bus policy), and an s6 service of its own that runs it, `after` the bus. NetworkManager and wpa_supplicant are set up exactly that way in `nix/laptop.nix`. |
+| **polkit** | none | `doas`. NetworkManager lets local users change the network without asking (`auth-polkit = false`). |
 | **`systemd --user`** | `session-commands` | above |
 | **timers / cron** | none | a long-running loop (above) |
 | **journald** | per-service logs in `/var/log/<name>/`; `/dev/log` goes to the `syslog` service (`/var/log/syslog/`) | `s6-tai64nlocal < /var/log/NAME/current` |
 | **tmpfiles.d** | none | `mkdir = { ... };` in the service, or a oneshot |
 | **https certificates** (`/etc/ssl`, `SSL_CERT_FILE`) | Mozilla's list from `cacert`, in `/etc/ssl` and `$SSL_CERT_FILE`, as on NixOS | nothing |
-| **resolved** | `dnscache` on 127.0.0.1, `/etc/resolv.conf` points to it | nothing |
-| **NetworkManager** | **eiwd** for Wi-Fi, configured by files | [configuring.md](configuring.md#wi-fi). Wired Ethernet DHCP isn't set up yet. |
+| **resolved** | NetworkManager writes each network's DNS servers to `/etc/resolv.conf` | nothing |
+| **NetworkManager** | NetworkManager, with wpa_supplicant and libudev-zero ([`by-name/ne/networkmanager`](../by-name/ne/networkmanager/service.nix)) | `nmtui`; [configuring.md](configuring.md#network-and-wi-fi). No dispatcher scripts, no VPN plugins. |
 | **`/usr/bin/foo`**, FHS paths | only `/bin/sh` and `/usr/bin/env` exist, as on NixOS | Same answers as on NixOS: `steam-run` or `buildFHSEnv` for prebuilt binaries, `appimage-run` for AppImages. |
 | **`sudo`** | `doas` | `doas`, or alias `sudo=doas` |
 | **`shutdown`, `reboot`** | `/run/init/bin/poweroff`, `/run/init/bin/reboot` | ly's F1/F2 also work |

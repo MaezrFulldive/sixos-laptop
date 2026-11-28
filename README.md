@@ -9,12 +9,19 @@ instead of systemd) as the **only** operating system on a laptop.
 
 What you end up with:
 
-- **ly** login screen on tty1 that starts the **mango** Wayland compositor
+- **ly** login screen on tty1 that starts the **mango** Wayland compositor,
+  with what mango's defaults expect: foot, rofi, sound (PipeWire),
+  screenshots, clipboard history, portals, a keyring (or no desktop at all)
+- optionally **qutebrowser**, with mpv, yt-dlp, GStreamer, spell checking
+  and its PDF viewer
+- **NetworkManager** (`nmtui`) for Wi-Fi and wired networks, and enough tools
+  to repair the system from its own console: vim, git, curl, ssh, w3m, disk
+  tools
 - password-protected `doas`, and a password-protected root login on tty2 for
   rescue
 - a **prebuilt** kernel and firmware from NixOS (no kernel compiling)
 - GRUB (UEFI) with a "sixos" and a "sixos (fallback)" entry
-- s6 / s6-rc as the init system, Wi-Fi through `eiwd`, zram swap
+- s6 / s6-rc as the init system, zram swap
 
 ## How this repository stays up to date
 
@@ -37,17 +44,17 @@ these instructions, so you never paste a hash by hand. Currently pinned:
   opens a pull request for you to review instead of switching on its own.
 - **Every push and pull request** runs the [test workflow](.github/workflows/test.yml).
   The same test runs locally with `nix-build tests -A all`.
-  It builds the laptop configuration, then runs the over-ssh install command
-  ([`scripts/install-over-ssh`](scripts/install-over-ssh), which runs the same
-  [`installer/sixos-install.sh`](installer/sixos-install.sh) as the live-USB
-  install) inside a VM onto an empty disk.
-  It boots that disk with UEFI and an NVMe drive, the way a laptop does, and
-  checks the following ([details](tests/default.nix)):
+  It builds the laptop configuration, then runs the install command
+  ([`scripts/install-on-live-usb`](scripts/install-on-live-usb)) inside a VM
+  twice: onto an empty disk, then again reusing that disk. It boots the
+  result with UEFI, an NVMe drive and a network card, the way a laptop does,
+  and checks the following ([details](tests/default.nix)):
   - the system boots to a login prompt
-  - passwords work for root and the user
+  - passwords work for root and the user, and survive the reinstall
   - `doas` asks for a password and rejects a wrong one
-  - ly, seatd and dnscache are running
-  - logging in through ly starts mango (a screenshot is saved)
+  - NetworkManager gets an address by DHCP and has the Wi-Fi networks
+  - logging in through ly starts mango (a screenshot is saved), with sound,
+    portals, the keyring and the clipboard history working
   - `poweroff` powers off instead of rebooting
 
   It also checks every link in this README.
@@ -62,153 +69,97 @@ these instructions, so you never paste a hash by hand. Currently pinned:
 
 Everything happens on the laptop itself, booted from a **NixOS live USB**.
 The live USB already has `nix`; you only use it for the install and don't
-install NixOS. The laptop's disk is **completely erased**.
+install NixOS. sixos becomes the only system on the disk.
 
 - **UEFI only.** Turn off **Secure Boot** in the laptop's firmware settings.
   The kernel and GRUB are not signed.
-- **Internet access** is needed during the install (about 1.8 GB is
-  downloaded from cache.nixos.org, straight onto the laptop's disk).
-- **Almost nothing is compiled.** The kernel, firmware, nix, mesa, ly and
-  mango all come prebuilt. Only a few small packages that sixos patches
-  (busybox, s6-rc, s6-linux-init, abduco, alsa-utils, mdev-like-a-boss) are
-  compiled, which takes a few minutes.
-- **Logins after the install:**
-  - **tty1: ly.** Pick your user, type your password, and mango starts.
-  - **tty2 (Ctrl+Alt+F2): rescue console.** Kernel messages appear here,
-    with a plain `login:` prompt for root.
-  - **`doas`** asks for your password.
-  - Password hashes are stored in `/etc/shadow`, readable only by root, and
-    never in the Nix store.
-- **Not included yet:** sound (no audio server), disk encryption, a screen
-  locker, and sshd (see `sshd = true` in step 3 to add it). See
-  [Troubleshooting](#troubleshooting) for adding sound.
+- **Internet access** is needed during the install (about 2 GB, 3 GB with
+  qutebrowser, downloaded from cache.nixos.org straight onto the laptop's
+  disk).
+- **Almost nothing is compiled.** The kernel, firmware, nix, mesa, ly, mango
+  and the programs come prebuilt. Only a few small packages that sixos
+  patches (busybox, s6-rc, s6-linux-init, abduco, alsa-utils,
+  mdev-like-a-boss) are compiled, which takes a few minutes.
+- **Reinstalling?** If the disk already has sixos on it (also an install
+  that stopped halfway), the installer offers to **reuse** it: it keeps the
+  Nix store (nothing is downloaded or compiled twice), `/home`, the
+  passwords and the Wi-Fi networks, and replaces the rest.
+- **Not included yet:** disk encryption, a screen locker, Bluetooth, and
+  sshd (`sshd = true` in the host file adds it).
 
 ---
 
-## 1. Boot the live USB
+## 1. Boot the live USB and connect
 
 1. Download a **NixOS ISO** from <https://nixos.org/download/>. The
-   graphical one makes Wi-Fi easy; the **minimal** one is much smaller, if
-   your USB sticks are small. Nothing else is stored on the stick: the
-   install builds the system straight onto the laptop's disk. Write the ISO
-   to a USB stick from any Linux computer (check `/dev/sdX` with `lsblk`
-   first; everything on it is erased):
+   graphical one makes Wi-Fi easy (and the installer takes the network you
+   connect to over to the new system); the **minimal** one is much smaller.
+   Write it to a USB stick from any Linux computer (check `/dev/sdX` with
+   `lsblk` first; everything on it is erased):
    `sudo dd if=nixos-*.iso of=/dev/sdX bs=4M status=progress oflag=sync`
 2. Boot the laptop from it and connect to the internet. Ethernet or USB
-   tethering from a phone needs no setup. For Wi-Fi on the minimal ISO, see
+   tethering from a phone needs no setup. Wi-Fi: the network icon on the
+   graphical ISO; on the minimal one, see
    [networking in the NixOS manual](https://nixos.org/manual/nixos/stable/#sec-installation-manual-networking).
 
 ---
 
-## 2. Collect hardware facts
+## 2. Get this repository
 
-Open a terminal on the live USB and write down the results:
-
-```sh
-# (a) the Wi-Fi interface name (wlan0, wlp2s0, ...)
-ip -br link
-
-# (b) the sysfs path of the Wi-Fi card  -> WIFI_SYSFS
-readlink -f /sys/class/net/wlp2s0/device
-#   example: /sys/devices/pci0000:00/0000:00:14.3
-
-# (c) the Wi-Fi kernel driver -> WIFI_MODULE
-basename "$(readlink -f /sys/class/net/wlp2s0/device/driver/module)"
-#   example: iwlwifi (Intel), ath11k_pci, mt7921e, rtw89_8852be ...
-
-# (d) the disk -> DISK   (nvme0n1 = NVMe, sda = SATA)
-lsblk -d -o NAME,SIZE,MODEL
-```
-
----
-
-## 3. Get this repository and configure it
-
-Still on the live USB:
+Open a terminal on the live USB:
 
 ```sh
-cd ~
 nix-shell -p git --run 'git clone https://github.com/MaezrFulldive/sixos-laptop.git'
 cd sixos-laptop
-nano site/hosts/laptop.nix
 ```
-
-Change the values marked `CHANGE ME`:
-
-```nix
-  username = "me";                                   # your user name
-  root-disk-modules = [ "nvme" ];                    # "ahci" for a SATA disk
-  wifi = {
-    module = "iwlwifi";                              # WIFI_MODULE from step 2
-    sysfs = "/sys/devices/pci0000:00/0000:00:14.3";  # WIFI_SYSFS from step 2
-  };
-```
-
-The same file shows how to add programs (`extra-packages`), ly settings and
-`sshd = true` (for pushing updates from another computer, step 6; it adds
-one more compile, openssh). Everything else is in
-[`nix/laptop.nix`](nix/laptop.nix), which the automated test also uses.
 
 ---
 
-## 4. Install
-
-**This erases the whole disk.** The script shows the disk and asks you to
-type its name before doing anything:
+## 3. Install
 
 ```sh
-sudo ./scripts/install-on-live-usb --disk /dev/nvme0n1 --user me --wifi "MyHomeWifi"
+sudo ./scripts/install-on-live-usb
 ```
 
-| option | value |
+It asks, with the answer in `[brackets]` taken when you press Enter:
+
+| question | |
 | --- | --- |
-| `--disk` | `DISK` from step 2, e.g. `/dev/nvme0n1` |
-| `--user` | the `username` in `site/hosts/laptop.nix` |
-| `--wifi` | optional: a Wi-Fi network for the installed system (it asks for the passphrase) |
+| which disk | the live USB itself isn't offered |
+| reuse the sixos already on it? | only asked if there is one |
+| host name | `laptop`; also the name of your settings file, `site/hosts/laptop.nix` |
+| your user name | |
+| install the desktop? | ly + mango and its programs; "no" gives a text console |
+| install qutebrowser? | with mpv, yt-dlp, GStreamer, spell checking |
+| Wi-Fi networks | the ones the live USB is connected to are offered; add more by name |
 
-It asks for the new system's **root password** (rescue console) and **your
-password** (ly and doas). Then it:
+It writes your answers to `site/hosts/<host>.nix` (it detects the disk's
+drivers itself), shows a summary, and asks you to type `erase` before
+touching the disk. Then it asks for **your password** (ly and doas) and the
+**root password** (the rescue console on tty2; Enter = the same as yours),
+and runs on its own:
 
-1. builds the installer (prebuilt, about 300 MB into the live USB's memory)
-2. partitions the disk: a 1 GiB EFI partition `ESP` and an ext4 root `sixos`,
-   and mounts it at `/mnt`
-3. writes `/etc/shadow`, the `/etc` links, ssh host keys and Wi-Fi config,
-   and copies this repository to `~/sixos-laptop` on the new disk
-4. builds the system **directly into `/mnt/nix/store`** (`nix-build --store
-   /mnt`), so the downloads and build files land on the disk, not in the
-   live USB's memory
-5. copies the kernel and initrd to the ESP and installs GRUB (also at the
+1. partitions the disk (a 1 GiB EFI partition `ESP` and an ext4 root
+   `sixos`), or, reusing it, cleans out everything but the Nix store,
+   `/home` and `/root`
+2. writes `/etc/shadow`, the Wi-Fi networks and ssh host keys, and copies
+   this repository to `~/sixos-laptop` on the new disk
+3. builds the system **directly into the disk's `/nix/store`**, so the
+   downloads land on the disk, not in the live USB's memory
+4. copies the kernel and initrd to the ESP and installs GRUB (also at the
    fallback path `EFI/BOOT/BOOTX64.EFI`, so it boots even if the firmware
    forgets the boot entry)
 
-If it stops during the build (step 4, e.g. the network dropped), fix the
-cause and run the same command with `--resume` added: it keeps the disk and
-everything already downloaded. Without `--resume` it starts over.
+**If it stops** (the network dropped, ...), fix the cause and run it again:
+answer "yes" to reusing the disk, and it continues with everything it
+already downloaded.
 
 When it says it's done, type `reboot` and remove the USB stick.
-
-> `eiwd` is iwd without D-Bus, so there is **no `iwctl`**. To add another
-> network later, create `/etc/iwd/networks/<SSID>.psk` containing
-> `[Security]` and `Passphrase=...` (see `man iwd.network` for SSIDs with
-> special characters).
-
-### Alternative: install from another computer over ssh
-
-If you'd rather build on another Linux computer with Nix,
-[`scripts/install-over-ssh`](scripts/install-over-ssh) builds the system
-there and copies it to the laptop's disk over the network. Set a root
-password on the live USB (`sudo passwd root`), find its address with
-`ip -br addr`, then on the other computer:
-
-```sh
-./scripts/install-over-ssh LAPTOP_IP --disk /dev/nvme0n1 --user me --wifi "MyHomeWifi"
-```
-
-`./scripts/install-over-ssh --help` lists all options.
+`./scripts/install-on-live-usb --help` lists a flag for every question.
 
 ---
 
-## 5. First boot
+## 4. First boot
 
 1. GRUB shows "sixos". Let it boot.
 2. Boot messages go to tty2, so tty1 stays blank until ly appears.
@@ -216,133 +167,96 @@ password on the live USB (`sudo passwd root`), find its address with
    password field, so type your password and press Enter. Mango is the only
    session. (To pick a different user, move up to the login field and use
    Left/Right; ly's login field is a list, not a text box.)
-4. **mango** starts with its default config (`/etc/mango/config.conf`):
-   - `Alt+Return`: foot terminal
-   - `Alt+Space`: rofi launcher
-   - `Alt+Q`: close a window
-   - `Super+M`: quit mango and go back to ly
+4. **mango**:
+
+   | keys | |
+   | --- | --- |
+   | `Alt+Return` | foot terminal |
+   | `Alt+Space` | rofi launcher |
+   | `Alt+Q` | close a window |
+   | `Print` | screenshot of an area, to annotate in satty (saved to `~/Pictures/Screenshots`) |
+   | `Shift+Print` | the whole screen, to the clipboard |
+   | `Super+V` | clipboard history |
+   | volume and brightness keys | work |
+   | `Super+M` | quit mango and go back to ly |
 
    To customize it, run
    `mkdir -p ~/.config/mango && cp /etc/mango/config.conf ~/.config/mango/`
-   and edit the copy.
+   and edit the copy. Keep its last line, `source=/etc/mango/sixos.conf`:
+   that's where the screenshot, clipboard and media keys come from.
 5. **tty2** (Ctrl+Alt+F2) has the boot log and a `login:` prompt for root.
+   Without the desktop, that prompt is on tty1.
 
-Useful commands (`doas` asks for your password):
+**Your configuration** is the copy of this repository in **`~/sixos-laptop`**
+(there is no `/etc/nixos`). This machine's settings are in
+`~/sixos-laptop/site/hosts/<host>.nix`; after changing them:
 
 ```sh
+sixos-rebuild switch          # build, switch to it, and boot it from now on
+```
+
+Commit your host file (`git add site/hosts; git commit`), so `git pull`
+merges the weekly updates into it.
+
+Useful commands:
+
+```sh
+nmtui                         # Wi-Fi and other networks
 doas s6-rc -a list            # services that are up
-doas s6-rc -u change wifi     # start a service (and what it depends on)
-doas s6-rc -d change wifi     # stop it
 ls /var/log/                  # one log directory per service
-tail -f /var/log/wifi/current # e.g. the Wi-Fi log
 doas /run/init/bin/poweroff   # shut down   (reboot: /run/init/bin/reboot)
 ```
 
-To change a password:
-
-```sh
-HASH=$(mkpasswd -m sha512)                            # asks for the new password
-doas sed -i "s|^me:[^:]*:|me:$HASH:|" /etc/shadow     # use root instead of me for root
-```
-
-**Your configuration** is the copy of this repository the installer put in
-**`~/sixos-laptop`** (there is no `/etc/nixos`). This machine's settings are
-in `~/sixos-laptop/site/hosts/laptop.nix`; after changing it, run
-`nix-build -A hosts.laptop.configuration && doas ./result/bin/deploy` in
-`~/sixos-laptop`.
-
 **Next: [docs/](docs/README.md)** explains how to configure and use the
-system: adding programs, sound, services, several machines, and how sixos
-differs from NixOS (infusions instead of modules, s6 instead of systemd).
+system: adding programs, services, several machines, and how sixos differs
+from NixOS (infusions instead of modules, s6 instead of systemd).
 
 ---
 
-## 6. Updating later
+## 5. Updating later
 
-Pull the latest tested pins, then rebuild and deploy. Use either option:
-
-**On the laptop itself** (in the copy step 4 made):
+Pull the latest tested pins, then rebuild:
 
 ```sh
 cd ~/sixos-laptop
 git pull
-nix-build -A hosts.laptop.configuration
-doas ./result/bin/deploy
+sixos-rebuild switch
 ```
 
-**From another computer, pushing to the laptop** (needs `sshd = true` in
-`site/hosts/laptop.nix` and `--ssh-key ~/.ssh/id_ed25519.pub` given to the
-install command):
-
-```sh
-cd ~/sixos-laptop
-git pull
-nix-build -A hosts.laptop.configuration
-nix copy --no-check-sigs --to ssh://root@LAPTOP_IP ./result
-ssh root@LAPTOP_IP "$(readlink -f result)/bin/deploy"
-```
-
-`deploy` switches the running system to the new one, restarting only the
+`switch` switches the running system to the new one, restarting only the
 services that changed. It also makes the new system the default for the
 next boot: it copies the kernel and initrd to the ESP and keeps the previous
 system as **"sixos (fallback)"** in GRUB.
 
 > ⚠️ If an update changes ly (its package or settings, which most NixOS
-> updates do), `deploy` restarts ly, which **ends your mango session**.
-> Save your work first, or run `./result/bin/nextboot` instead of `deploy`
-> and reboot.
+> updates do), `switch` restarts ly, which **ends your mango session**.
+> Save your work first, or run `sixos-rebuild boot` instead and reboot.
 
-Other commands in `result/bin/`: `activate` (switch the running system only),
-`dry-activate` (show what would change), `nextboot` (boot this next time,
-don't touch the running system), `kexec` (jump straight into the new kernel).
+`sixos-rebuild --help` shows the others: `boot`, `test`, `build`,
+`dry-activate`.
 
-If you changed `site/hosts/laptop.nix`, commit it on your own branch, so
-`git pull` merges the weekly updates into it.
+**From another computer, pushing to the laptop** (needs `sshd = true` in the
+host file, and the other computer's key in the laptop's
+`/root/.ssh/authorized_keys`; the installer's `--ssh-key` puts it there):
+
+```sh
+cd ~/sixos-laptop
+nix-build -A hosts.laptop.configuration
+nix copy --no-check-sigs --to ssh://root@LAPTOP_IP ./result
+ssh root@LAPTOP_IP "$(readlink -f result)/bin/deploy"
+```
 
 ---
 
 ## Troubleshooting
 
-**`git pull` or `nix-build` fails with "SSL certificate problem" or "SSL connect error"**
-Systems installed before this was fixed have no https certificates, so the
-fix can't be downloaded either. Bring the certificate file over once from
-another computer on the same network (any Linux machine has it):
-
-```sh
-# on the other computer: serve the file, and note its checksum and IP address
-cd /etc/ssl/certs && sha256sum ca-certificates.crt && ip -4 addr
-python3 -m http.server 8000                  # Ctrl+C when the laptop has it
-```
-
-```sh
-# on the laptop
-doas mkdir -p /etc/ssl/certs
-doas wget -O /etc/ssl/certs/ca-certificates.crt http://OTHER_IP:8000/ca-certificates.crt
-sha256sum /etc/ssl/certs/ca-certificates.crt     # must match the other computer
-doas s6-svc -r /run/service/nix-daemon           # it reads the file when it starts
-cd ~/sixos-laptop
-SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt git pull
-nix-build -A hosts.laptop.configuration
-doas ./result/bin/nextboot
-doas rm -r /etc/ssl              # the new system links its own /etc/ssl at boot
-doas /run/init/bin/reboot
-```
-
-After the reboot, https works for git, nix and everything else.
-
-**`install-on-live-usb` stopped while building**
-Run the same command again with `--resume`; it keeps what was already
-downloaded. If the live USB itself runs out of memory before the disk is
-prepared (step 1 of the script), use a laptop with more RAM or the
-[over-ssh install](#alternative-install-from-another-computer-over-ssh).
-"--user ... does not match" means `--user` and `username` in
-`site/hosts/laptop.nix` differ.
-
-**`install-over-ssh`: "Permission denied" or "Connection refused"**
-Run `sudo passwd root` on the live USB (its root password starts out empty,
-and ssh refuses empty passwords). Check `LAPTOP_IP` with `ip -br addr` on the
-laptop, and that both machines are on the same network. If the install
-stopped halfway, just run the same command again: it starts over.
+**The installer stopped**
+Run it again and reuse the disk: it continues with what it already
+downloaded. "no internet connection": connect first (step 1). "has an
+error" after writing the host file: the message above it names the line;
+fix `site/hosts/<host>.nix` and run it again. If the live USB itself runs
+out of memory, it's before the disk was touched: use the minimal ISO, which
+leaves more memory free.
 
 **`nix-build` error: "host contains unknown top-level attrNames: ..."**
 A typo in `site/hosts/laptop.nix` or `nix/laptop.nix`. The allowed keys are in
@@ -397,13 +311,21 @@ tty2.
 `/etc/securetty` must exist (the installer writes it). Without it, busybox
 `login` rejects root's correct password.
 
-**Wi-Fi doesn't come up**
-Read `/var/log/wifi/current`. "does not exist yet, sleeping" means the
-`sysfs` value in `site/hosts/laptop.nix` is wrong. Firmware errors in
-`dmesg` point at a missing or wrong `module`.
+**No network / Wi-Fi doesn't connect**
+`nmcli device` lists the network devices. If the Wi-Fi card is missing,
+`dmesg | grep -i firmware` shows whether its firmware failed to load. If it
+is "unavailable", check `rfkill` (a Wi-Fi key or switch). NetworkManager's
+log: `tail /var/log/networkmanager/current`.
 
 **No sound**
-Sound is not set up by default: see [docs/configuring.md](docs/configuring.md#sound).
+`wpctl status` lists the devices; `pidof pipewire wireplumber pipewire-pulse`
+should print three numbers (they start with your session). `id` must list
+`_audio`. Their messages are in `~/ly-session.log`.
+
+**Screenshots, screen sharing or file pickers don't work**
+They go through the portals, which start on demand: `pidof xdg-desktop-portal`
+after trying. If you copied mango's config, check that it still ends with
+`source=/etc/mango/sixos.conf`. Errors are in `~/ly-session.log`.
 
 **A system that won't boot at all**
 Pick "sixos (fallback)" in GRUB. If that fails too, boot the live USB, then
@@ -421,15 +343,15 @@ that matters, set a GRUB password (`grub-mkpasswd-pbkdf2`, then
 
 | path | what it is |
 | --- | --- |
-| [`site/hosts/laptop.nix`](site/hosts/laptop.nix) | **your** settings |
-| [`nix/laptop.nix`](nix/laptop.nix) | the system configuration: ly, mango, doas, PAM, kernel, services |
+| [`site/hosts/laptop.nix`](site/hosts/laptop.nix) | **your** settings (the installer writes this file) |
+| [`nix/laptop.nix`](nix/laptop.nix) | the system configuration: network, rescue tools, doas, PAM, kernel, services |
+| [`nix/desktop.nix`](nix/desktop.nix) | the desktop: mango's session, its programs and key bindings, qutebrowser |
 | [`docs/`](docs/README.md) | how to configure and use the installed system |
-| [`by-name/`](by-name) | services of your own ([docs/services.md](docs/services.md)) |
+| [`by-name/`](by-name) | services of this repository: NetworkManager, the D-Bus system bus, ... ([docs/services.md](docs/services.md)) |
 | [`pins.json`](pins.json) | every upstream source, updated weekly |
 | [`patches/sixos/`](patches/sixos) | changes to upstream sixos (below) |
-| [`scripts/install-on-live-usb`](scripts/install-on-live-usb) | the install command from step 4 |
-| [`scripts/install-over-ssh`](scripts/install-over-ssh) | the same, run from another computer |
-| [`installer/sixos-install.sh`](installer/sixos-install.sh) | the part of it that runs on the laptop |
+| [`scripts/install-on-live-usb`](scripts/install-on-live-usb) | the install command from step 3 |
+| [`installer/sixos-install.sh`](installer/sixos-install.sh) | the part of it that partitions, writes `/etc` and installs GRUB |
 | [`tests/`](tests) | the VM test; run it yourself with `nix-build tests -A all` |
 | [`scripts/update-pins.py`](scripts/update-pins.py) | what the weekly update runs |
 

@@ -18,7 +18,8 @@
 | udev | mdevd, with libudev-zero for programs that link libudev |
 | journald / `journalctl -u foo` | `/var/log/foo/current`, one directory per service |
 | `systemctl status/start/stop/restart foo` | `s6-svstat`, `s6-rc -u change`, `s6-rc -d change`, `s6-svc -r` ([table](configuring.md#services)) |
-| `nixos-rebuild switch` | `nix-build -A hosts.<name>.configuration && doas ./result/bin/deploy` |
+| `nixos-rebuild switch` / `boot` / `test` | `sixos-rebuild switch` / `boot` / `test` (a small script: `nix-build -A hosts.<name>.configuration && doas ./result/bin/deploy`) |
+| `networking.networkmanager.enable` | always on here; `nmtui` |
 | generations in the boot menu | "sixos" and "sixos (fallback)" (the previous one) |
 | NixOS options search | the arguments at the top of each `service.nix`, and `nix/laptop.nix` |
 
@@ -92,7 +93,7 @@ ones did). That's how `nix/laptop.nix` is built:
 infuse host-prev ([
   { ... the base settings ... }
   { ... sshd on or off ... }
-] ++ lib.optional (wifi != null) { targets.wifi.__assign = ...; }
+] ++ lib.optional desktop { targets.ly.__assign = ...; }
   ++ lib.toList (extra-config host-final))
 ```
 

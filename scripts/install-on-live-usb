@@ -1,123 +1,482 @@
 #!/usr/bin/env bash
-# Install sixos on this laptop, entirely from the NixOS live USB it is
-# running.  No second computer is needed.
+# Install sixos on this computer from the NixOS live USB it is running.
 #
-#   1. builds the installer (prebuilt from cache.nixos.org, nothing compiled)
-#   2. runs `sixos-install --phase prepare`: asks for the passwords, erases
-#      and partitions the disk, mounts it at /mnt, copies this repository to
-#      /mnt/home/USER/sixos-laptop
-#   3. builds the system straight into the new disk's /mnt/nix/store, so the
-#      downloads (about 1.8 GB) and the few small packages that are compiled
-#      go to the disk, not to the live USB's memory
-#   4. runs `sixos-install --phase finish`: boot profiles, GRUB, unmount
+#   sudo ./scripts/install-on-live-usb
 #
-# If step 3 fails (e.g. the network dropped), fix the cause and run the same
-# command again with --resume: it keeps the disk and everything already
-# downloaded.
+# It asks a few questions (every question has a flag, see --help), then:
+#   1. writes site/hosts/HOST.nix from the answers (disk driver detected)
+#   2. erases and partitions the disk, or, when the disk already has sixos on
+#      it, reuses it: its Nix store (nothing is downloaded or built twice),
+#      /home, the passwords and the Wi-Fi networks
+#   3. builds the system straight into the disk's /nix/store, so the
+#      downloads and builds go to the disk, not to the live USB's memory
+#   4. installs GRUB
+#
+# If anything fails (the network dropped, ...), fix it and run it again: it
+# offers to reuse the disk, and continues where it stopped.
 
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: sudo scripts/install-on-live-usb --disk DEV --user NAME [options]
+Usage: sudo scripts/install-on-live-usb [options]
 
-  --disk DEV        the disk to ERASE, e.g. /dev/nvme0n1 (`lsblk -d`)
-  --user NAME       the `username` in site/hosts/HOST.nix
+Without options it asks for everything.  The options answer the questions:
 
-Options:
-  --host HOST       which machine in site/hosts/ to install (default: laptop)
-  --wifi SSID       Wi-Fi network for the installed system (asks for the
-                    passphrase)
-  --ssh-key FILE    public key allowed to log in as root over ssh; only
-                    useful with `sshd = true` in site/hosts/laptop.nix
-  --uid N           the user's uid, if you changed it (default 1000)
-  --resume          the disk was already prepared by an earlier run that
-                    stopped while building: skip erasing it and continue
-  --yes, --no-nvram passed on to sixos-install (see sixos-install --help)
+  --disk DEV          the disk to install on, e.g. /dev/nvme0n1 (`lsblk -d`)
+  --keep              the disk has sixos on it already: reinstall, keeping its
+                      Nix store, /home, passwords and Wi-Fi networks
+  --erase             erase the disk, even if it has sixos on it
+  --host NAME         the host name, and the file site/hosts/NAME.nix
+                      (default: the earlier install's, or "laptop")
+  --use-host-file     use site/hosts/NAME.nix as it is (don't rewrite it)
+  --user NAME         your user name
+  --uid N             your user id (default 1000, or the earlier install's)
+  --desktop, --no-desktop
+                      ly + mango and the desktop programs (default: yes)
+  --qutebrowser, --no-qutebrowser
+                      qutebrowser, mpv, yt-dlp, GStreamer ... (default: no)
+  --wifi SSID         a Wi-Fi network for the installed system (asks for the
+                      passphrase); may be given several times
+  --no-wifi           don't ask about Wi-Fi, and don't copy the live USB's
+  --keep-passwords    with --keep: keep the passwords without asking
+  --ssh-key FILE      a public key that may log in as root over ssh
+                      (with `sshd = true` in the host file)
+  --yes               don't ask anything; use the options and the defaults
+  --no-nvram          don't add a firmware boot entry (GRUB is always
+                      installed at the fallback path EFI/BOOT/BOOTX64.EFI)
+
+For the automated test (skips the builds):
+  --installer PATH    an already built `nix-build -A installer`
+  --system PATH       an already built system, copied from this machine's store
 EOF
 }
 
-die() { echo "install-on-live-usb: $*" >&2; exit 1; }
+die() { printf '\n\033[1;31minstall-on-live-usb: %s\033[0m\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MNT=/mnt
+PROBE=/run/sixos-install-probe
 
-DISK='' USERNAME='' USER_UID=1000 RESUME='' HOST=laptop
-PASS=()
+DISK='' MODE='' HOST='' USE_HOST_FILE='' USERNAME='' USER_UID=''
+answer='' ssid=''
+DESKTOP='' QUTEBROWSER='' NO_WIFI='' KEEP_PASSWORDS='' SSH_KEY='' ASSUME_YES='' NO_NVRAM=''
+INSTALLER='' SYSTEM=''
+WIFI_SSIDS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk) DISK=$2; shift 2 ;;
+    --keep) MODE=keep; shift ;;
+    --erase) MODE=erase; shift ;;
+    --host) HOST=$2; shift 2 ;;
+    --use-host-file) USE_HOST_FILE=1; shift ;;
     --user) USERNAME=$2; shift 2 ;;
     --uid) USER_UID=$2; shift 2 ;;
-    --host) HOST=$2; shift 2 ;;
-    --wifi) PASS+=(--wifi "$2"); shift 2 ;;
+    --desktop) DESKTOP=true; shift ;;
+    --no-desktop) DESKTOP=false; shift ;;
+    --qutebrowser) QUTEBROWSER=true; shift ;;
+    --no-qutebrowser) QUTEBROWSER=false; shift ;;
+    --wifi) WIFI_SSIDS+=("$2"); shift 2 ;;
+    --no-wifi) NO_WIFI=1; shift ;;
+    --keep-passwords) KEEP_PASSWORDS=1; shift ;;
     --ssh-key)
       [ -f "$2" ] || die "--ssh-key: $2 does not exist"
-      PASS+=(--ssh-key "$(cat "$2")"); shift 2 ;;
-    --resume) RESUME=1; shift ;;
-    --yes|--no-nvram) PASS+=("$1"); shift ;;
+      SSH_KEY=$(cat "$2"); shift 2 ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --no-nvram) NO_NVRAM=1; shift ;;
+    --installer) INSTALLER=$2; shift 2 ;;
+    --system) SYSTEM=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
 done
-[ -n "$DISK" ] && [ -n "$USERNAME" ] || { usage >&2; exit 1; }
-[ "$(id -u)" = 0 ] || die "run it as root: sudo $0 ..."
-[ -b "$DISK" ] || die "$DISK is not a block device (see \`lsblk -d\`)"
-command -v nix-build >/dev/null || die "no nix-build: boot the NixOS live USB"
-[ -d /sys/firmware/efi ] || echo "warning: not booted with UEFI; the laptop may not boot the installed system" >&2
 
-[ -f "$ROOT/site/hosts/$HOST.nix" ] || die "--host: there is no site/hosts/$HOST.nix"
-grep -q "username *= *\"$USERNAME\"" "$ROOT/site/hosts/$HOST.nix" \
-  || die "--user $USERNAME does not match the username in site/hosts/$HOST.nix"
+[ "$(id -u)" = 0 ] || die "run it as root: sudo $0"
+command -v nix-build >/dev/null || die "no nix-build: boot the NixOS live USB"
+
+# ask VAR QUESTION DEFAULT: read an answer into VAR (the default with --yes)
+ask() {
+  local __var=$1 __q=$2 __def=${3:-} __a
+  if [ -n "$ASSUME_YES" ]; then printf -v "$__var" '%s' "$__def"; return; fi
+  if [ -n "$__def" ]; then
+    read -r -p "$__q [$__def] " __a </dev/tty
+  else
+    read -r -p "$__q " __a </dev/tty
+  fi
+  printf -v "$__var" '%s' "${__a:-$__def}"
+}
+# yesno QUESTION DEFAULT(y|n): succeeds for yes
+yesno() {
+  local a hint='(y/N)'
+  [ "$2" = y ] && hint='(Y/n)'
+  ask a "$1 $hint" ""
+  [ -n "$a" ] || a=$2
+  case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+# part DISK N: the device of partition N (/dev/nvme0n1 -> /dev/nvme0n1p2)
+part() { case "$1" in *[0-9]) echo "${1}p$2" ;; *) echo "$1$2" ;; esac; }
+
+WORKDIR=$(mktemp -d /tmp/sixos-install.XXXXXX)
+chmod 700 "$WORKDIR"
+cleanup() { umount "$PROBE" 2>/dev/null || true; rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+printf '\033[1msixos installer\033[0m  (Ctrl+C stops it; nothing is changed until you confirm)\n'
+[ -d /sys/firmware/efi ] || note "warning: this live USB was not booted with UEFI; the installed system needs UEFI to boot"
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+if [ -z "$SYSTEM" ]; then
+  if ! curl -fsS --max-time 15 -o /dev/null https://cache.nixos.org/nix-cache-info; then
+    die "no internet connection.  Connect first (README.md, step 1), then run this again."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Disk
+# ---------------------------------------------------------------------------
+step "Disk"
+# the live USB itself is not a candidate
+LIVE_DISK=
+for m in /iso /nix/.ro-store /run/rootfsbase; do
+  src=$(findmnt -n -o SOURCE "$m" 2>/dev/null | head -n 1 || true)
+  case "$src" in
+    /dev/*) LIVE_DISK=/dev/$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -n 1); break ;;
+  esac
+done
+mapfile -t CANDIDATES < <(lsblk -d -n -p -o NAME,TYPE | awk '$2 == "disk" { print $1 }' \
+  | grep -v -E '^/dev/(loop|zram|sr|ram)' | grep -v -x -F "${LIVE_DISK:-/nonexistent}" || true)
+if [ -z "$DISK" ]; then
+  [ ${#CANDIDATES[@]} -gt 0 ] || die "no disk found to install on (lsblk -d)"
+  lsblk -d -o NAME,SIZE,MODEL,TRAN "${CANDIDATES[@]}"
+  [ -z "$LIVE_DISK" ] || note "($LIVE_DISK is the live USB and is not listed)"
+  ask DISK "Install on which disk?" "${CANDIDATES[0]}"
+fi
+case "$DISK" in /dev/*) ;; *) DISK=/dev/$DISK ;; esac
+[ -b "$DISK" ] || die "$DISK is not a disk (see \`lsblk -d\`)"
+[ "$DISK" != "$LIVE_DISK" ] || die "$DISK is the live USB itself"
+
+# Is there an earlier sixos install (or an interrupted one) to reuse?
+OLD_HOST='' OLD_USER='' OLD_UID='' HAS_SIXOS='' STORE_SIZE='?'
+if [ "$(blkid -s LABEL -o value "$(part "$DISK" 2)" 2>/dev/null || true)" = sixos ]; then
+  umount -R "$MNT" 2>/dev/null || true
+  mkdir -p "$PROBE"
+  if mount -o ro "$(part "$DISK" 2)" "$PROBE" 2>/dev/null; then
+    if [ -d "$PROBE/nix/store" ]; then
+      HAS_SIXOS=1
+      # the system's store path is .../<hash>-six-system-<host>-...
+      for l in "$PROBE"/nix/var/nix/profiles/nextboot-*-link; do
+        [ -L "$l" ] || continue
+        OLD_HOST=$(basename "$(readlink "$l")" | sed -n 's/^[a-z0-9]*-six-system-\(.*\)-unknown-nixpkgs-version$/\1/p')
+      done
+      for h in "$PROBE"/home/*/; do
+        [ -d "$h" ] || continue
+        OLD_USER=$(basename "$h")
+        OLD_UID=$(stat -c %u "$h")
+        break
+      done
+      STORE_SIZE=$(du -sh "$PROBE/nix/store" 2>/dev/null | cut -f1 || echo '?')
+    fi
+    umount "$PROBE"
+  fi
+fi
+
+if [ -n "$HAS_SIXOS" ]; then
+  note "$DISK already has sixos on it${OLD_HOST:+ (host $OLD_HOST)}${OLD_USER:+, user $OLD_USER}, with a ${STORE_SIZE} Nix store."
+  if [ -z "$MODE" ]; then
+    note "Reusing it keeps its Nix store (far less to download, nothing compiled"
+    note "twice), /home, /root, the passwords, ssh host keys and Wi-Fi networks."
+    note "Everything else on it is replaced."
+    if yesno "Reuse it?" y; then MODE=keep; else MODE=erase; fi
+  fi
+else
+  [ "$MODE" != keep ] || die "--keep: $DISK has no sixos install to reuse"
+  MODE=erase
+fi
+
+# kernel modules the initrd needs for the disk: the drivers of the disk and
+# of every device between it and the CPU (e.g. nvme and vmd, ahci and sd_mod)
+disk_modules() {
+  local p
+  p=$(readlink -f "/sys/block/$(basename "$DISK")/device")
+  while [ -n "$p" ] && [ "$p" != /sys ] && [ "$p" != / ]; do
+    if [ -e "$p/driver/module" ]; then basename "$(readlink -f "$p/driver/module")"; fi
+    p=$(dirname "$p")
+  done | awk '!seen[$0]++'
+}
+mapfile -t DISK_MODULES < <(disk_modules)
+if [ ${#DISK_MODULES[@]} -eq 0 ]; then
+  case "$(basename "$DISK")" in nvme*) DISK_MODULES=(nvme) ;; *) DISK_MODULES=(ahci sd_mod) ;; esac
+fi
+
+# ---------------------------------------------------------------------------
+# Host and user
+# ---------------------------------------------------------------------------
+step "This machine"
+[ -n "$HOST" ] || ask HOST "Host name (also the file site/hosts/NAME.nix):" "${OLD_HOST:-laptop}"
+[[ "$HOST" =~ ^[a-z][a-z0-9-]*$ ]] || die "the host name may only have lowercase letters, digits and -"
+HOST_FILE=$ROOT/site/hosts/$HOST.nix
+
+if [ -f "$HOST_FILE" ] && [ -z "$USE_HOST_FILE" ] && [ -z "$DESKTOP$QUTEBROWSER$USERNAME" ]; then
+  if grep -q -E '^\s*wifi\s*=' "$HOST_FILE"; then
+    note "site/hosts/$HOST.nix is in the old format (with \`wifi = ...\`), so it is rewritten."
+  else
+    missing=()
+    for m in "${DISK_MODULES[@]}"; do grep -q "\"$m\"" "$HOST_FILE" || missing+=("$m"); done
+    if [ ${#missing[@]} -gt 0 ]; then
+      note "site/hosts/$HOST.nix exists, but lacks the disk drivers this disk needs (${missing[*]}), so it is rewritten."
+    elif yesno "site/hosts/$HOST.nix exists. Use it as it is (n: rewrite it from your answers)?" y; then
+      USE_HOST_FILE=1
+    fi
+  fi
+fi
+
+if [ -n "$USE_HOST_FILE" ]; then
+  [ -f "$HOST_FILE" ] || die "--use-host-file: there is no site/hosts/$HOST.nix"
+  file_user=$(sed -n 's/^[[:space:]]*username[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$HOST_FILE" | head -n 1)
+  [ -n "$file_user" ] || die "could not find \`username = \"...\";\` in site/hosts/$HOST.nix"
+  [ -z "$USERNAME" ] || [ "$USERNAME" = "$file_user" ] \
+    || die "--user $USERNAME does not match the username in site/hosts/$HOST.nix ($file_user)"
+  USERNAME=$file_user
+  USER_UID=$(sed -n 's/^[[:space:]]*uid[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$HOST_FILE" | head -n 1)
+  if grep -q -E '^\s*desktop\s*=\s*false' "$HOST_FILE"; then DESKTOP=false; else DESKTOP=true; fi
+  if grep -q -E '^\s*qutebrowser\s*=\s*true' "$HOST_FILE"; then QUTEBROWSER=true; else QUTEBROWSER=false; fi
+  mapfile -t DISK_MODULES < <(sed -n 's/^[[:space:]]*root-disk-modules[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p' "$HOST_FILE" | tr -d '"' | tr ' ' '\n' | grep . || true)
+else
+  [ -n "$USERNAME" ] || ask USERNAME "Your user name:" "$OLD_USER"
+  [ -n "$USERNAME" ] || die "a user name is needed (--user)"
+  [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "the user name may only have lowercase letters, digits, _ and -"
+  if [ -z "$USER_UID" ] && [ "$MODE" = keep ] && [ "$USERNAME" = "$OLD_USER" ]; then
+    USER_UID=$OLD_UID
+  fi
+  if [ -z "$DESKTOP" ]; then
+    if yesno "Install the desktop (ly + mango, foot, rofi, sound, screenshots, ...)?" y; then DESKTOP=true; else DESKTOP=false; fi
+  fi
+  if [ -z "$QUTEBROWSER" ]; then
+    QUTEBROWSER=false
+    if [ "$DESKTOP" = true ] && yesno "Install qutebrowser (with mpv, yt-dlp, GStreamer, spell checking; about 1 GB more)?" n; then
+      QUTEBROWSER=true
+    fi
+  fi
+fi
+USER_UID=${USER_UID:-1000}
+[ "$DESKTOP" = true ] || QUTEBROWSER=false
+
+# ---------------------------------------------------------------------------
+# Wi-Fi
+# ---------------------------------------------------------------------------
+WIFI_LIST=$WORKDIR/wifi   # SSID<TAB>passphrase, for sixos-install
+: > "$WIFI_LIST"
+WIFI_NAMES=()
+add_wifi() {   # SSID PASSPHRASE
+  local n
+  for n in "${WIFI_NAMES[@]}"; do [ "$n" = "$1" ] && return; done
+  printf '%s\t%s\n' "$1" "$2" >> "$WIFI_LIST"
+  WIFI_NAMES+=("$1")
+}
+ask_wifi_pass() {   # SSID: prints the passphrase
+  local pass
+  if [ -n "${SIXOS_WIFI_PASSPHRASE+set}" ]; then printf '%s' "$SIXOS_WIFI_PASSPHRASE"; return; fi
+  read -r -s -p "    passphrase for \"$1\" (Enter: an open network): " pass </dev/tty
+  echo >&2
+  printf '%s' "$pass"
+}
+
+if [ -z "$NO_WIFI" ]; then
+  step "Wi-Fi"
+  for ssid in "${WIFI_SSIDS[@]}"; do add_wifi "$ssid" "$(ask_wifi_pass "$ssid")"; done
+  # the networks this live USB knows: NetworkManager's (graphical live USB) ...
+  if command -v nmcli >/dev/null && nmcli -t general status >/dev/null 2>&1; then
+    while IFS=: read -r name type; do
+      [ "$type" = 802-11-wireless ] || continue
+      ssid=$(nmcli -g 802-11-wireless.ssid connection show "$name" 2>/dev/null || true)
+      [ -n "$ssid" ] || continue
+      pass=$(nmcli -s -g 802-11-wireless-security.psk connection show "$name" 2>/dev/null || true)
+      key=$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$name" 2>/dev/null || true)
+      if [ -n "$key" ] && [ -z "$pass" ]; then
+        note "the live USB knows \"$ssid\", but not its passphrase"
+        [ -z "$ASSUME_YES" ] || continue
+        pass=$(ask_wifi_pass "$ssid")
+      fi
+      note "from the live USB: \"$ssid\""
+      add_wifi "$ssid" "$pass"
+    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null || true)
+  fi
+  # ... iwd's ...
+  for f in /var/lib/iwd/*.psk; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .psk)
+    case "$name" in =*) continue ;; esac   # hex-encoded names: rare, skipped
+    note "from the live USB: \"$name\""
+    add_wifi "$name" "$(sed -n 's/^Passphrase=//p' "$f" | head -n 1)"
+  done
+  # ... or the one wpa_supplicant is connected to (minimal live USB; its
+  # passphrase can't be read back, so ask)
+  if [ ${#WIFI_NAMES[@]} -eq 0 ] && [ -z "$ASSUME_YES" ] && command -v wpa_cli >/dev/null; then
+    for w in /sys/class/net/*/wireless; do
+      [ -e "$w" ] || continue
+      ssid=$(wpa_cli -i "$(basename "$(dirname "$w")")" status 2>/dev/null | sed -n 's/^ssid=//p' || true)
+      [ -n "$ssid" ] || continue
+      note "the live USB is connected to \"$ssid\""
+      if yesno "    Use it on the installed system too?" y; then add_wifi "$ssid" "$(ask_wifi_pass "$ssid")"; fi
+    done
+  fi
+  [ "$MODE" != keep ] || note "(the earlier install's Wi-Fi networks are kept as well)"
+  if [ -z "$ASSUME_YES" ]; then
+    while true; do
+      ask ssid "Add a Wi-Fi network? Its name, or Enter to go on:" ""
+      [ -n "$ssid" ] || break
+      add_wifi "$ssid" "$(ask_wifi_pass "$ssid")"
+    done
+  fi
+  note "(networks can also be added later, with \`nmtui\`)"
+fi
+
+# ---------------------------------------------------------------------------
+# Confirm
+# ---------------------------------------------------------------------------
+step "Summary"
+if [ "$MODE" = keep ]; then what="REUSE it: keep the Nix store, /home, passwords, Wi-Fi"; else what="ERASE everything on it"; fi
+if [ -n "$USE_HOST_FILE" ]; then how="used as it is"; else how="written from these answers"; fi
+if [ "$DESKTOP" = true ]; then desk="ly + mango"; else desk="no (text console)"; fi
+note "disk:         $DISK  ($what)"
+note "host:         $HOST  (site/hosts/$HOST.nix, $how)"
+note "user:         $USERNAME (uid $USER_UID)"
+note "desktop:      $desk"
+note "qutebrowser:  $( [ "$QUTEBROWSER" = true ] && echo yes || echo no)"
+note "disk drivers: ${DISK_MODULES[*]}"
+note "Wi-Fi:        ${WIFI_NAMES[*]:-(none)}$( [ "$MODE" != keep ] || echo " + the earlier install's")"
+if [ -z "$ASSUME_YES" ]; then
+  if [ "$MODE" = erase ]; then
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL "$DISK" || true
+    ask answer "Type \"erase\" to ERASE $DISK and install:" ""
+    [ "$answer" = erase ] || die "stopped; nothing was changed"
+  else
+    yesno "Reinstall on $DISK?" y || die "stopped; nothing was changed"
+  fi
+fi
+
+# From here on, everything is also written to a log, which ends up in the
+# user's home directory.
+LOG=$WORKDIR/install.log
+exec > >(tee -a "$LOG") 2>&1
+
+if [ -z "$USE_HOST_FILE" ]; then
+  # -------------------------------------------------------------------------
+  step "Writing site/hosts/$HOST.nix"
+  # -------------------------------------------------------------------------
+  if [ -f "$HOST_FILE" ]; then
+    cp "$HOST_FILE" "$HOST_FILE.old"
+    note "(the previous version is now site/hosts/$HOST.nix.old)"
+  fi
+  modules=$(printf '"%s" ' "${DISK_MODULES[@]}")
+  uid_line=
+  [ "$USER_UID" = 1000 ] || uid_line="  uid = $USER_UID;"
+  cat > "$HOST_FILE" <<EOF
+# This machine's settings.  The file name ("$HOST") is the host name.
+# Written by scripts/install-on-live-usb on $(date +%Y-%m-%d); change anything
+# here, then run \`sixos-rebuild switch\` (docs/configuring.md).
+# Everything else lives in ../../nix/laptop.nix.
+args@{ laptop-host, ... }:
+
+laptop-host args {
+
+  username = "$USERNAME";
+$uid_line
+  # kernel modules the initrd needs to find the root disk (detected)
+  root-disk-modules = [ ${modules}];
+
+  # ly + mango and the desktop programs
+  desktop = $DESKTOP;
+
+  # qutebrowser, with mpv + yt-dlp, GStreamer, spell checking and pdf.js
+  qutebrowser = $QUTEBROWSER;
+
+  # More programs, from nixpkgs (search on https://search.nixos.org/packages):
+  # extra-packages = pkgs: with pkgs; [ firefox ];
+
+  # Programs that run while you're logged in (docs/services.md):
+  # session-commands = [ "mako" ];
+
+  # Anything else, as infusions (docs/multiple-machines.md), e.g. a service:
+  # extra-config = host: {
+  #   targets.earlyoom.__assign = host.services.earlyoom { };
+  # };
+
+  # Run sshd, to push updates from another computer.
+  # It adds one more package to compile (openssh).
+  # sshd = true;
+
+  # Extra ly settings, see https://codeberg.org/fairyglade/ly (res/config.ini):
+  # ly-settings = { animation = "matrix"; bigclock = "en"; };
+}
+EOF
+  cat "$HOST_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 step "Building the installer"
 # ---------------------------------------------------------------------------
-INSTALLER=$(nix-build "$ROOT" -A installer --no-out-link)
-echo "installer: $INSTALLER"
-
-if [ -z "$RESUME" ]; then
-  # -------------------------------------------------------------------------
-  step "Preparing $DISK"
-  # -------------------------------------------------------------------------
-  "$INSTALLER/bin/sixos-install" --phase prepare \
-    --disk "$DISK" --user "$USERNAME" --uid "$USER_UID" --copy "$ROOT" "${PASS[@]}"
-else
-  # mount the partitions an earlier run made, e.g. after a reboot
-  case "$DISK" in
-    *[0-9]) PART=${DISK}p ;;   # /dev/nvme0n1 -> /dev/nvme0n1p1
-    *) PART=$DISK ;;           # /dev/sda -> /dev/sda1
-  esac
-  mountpoint -q "$MNT" || mount "${PART}2" "$MNT" \
-    || die "--resume: could not mount ${PART}2 (run without --resume to start over)"
-  mountpoint -q "$MNT/boot" || mount "${PART}1" "$MNT/boot" \
-    || die "--resume: could not mount ${PART}1 (run without --resume to start over)"
-  [ -e "$MNT/etc/shadow" ] && [ -d "$MNT/nix/store" ] \
-    || die "--resume: $MNT is not a prepared sixos disk (run without --resume)"
+if [ -z "$INSTALLER" ]; then
+  INSTALLER=$(nix-build "$ROOT" -A installer --no-out-link)
 fi
+echo "installer: $INSTALLER"
+if [ -z "$SYSTEM" ]; then
+  step "Checking site/hosts/$HOST.nix"
+  nix-instantiate "$ROOT" -A "hosts.$HOST.configuration" >/dev/null \
+    || die "site/hosts/$HOST.nix has an error (above).  Fix it and run this again; the disk was not changed."
+fi
+
+# ---------------------------------------------------------------------------
+step "Preparing $DISK"
+# ---------------------------------------------------------------------------
+PASS=(--disk "$DISK" --user "$USERNAME" --uid "$USER_UID")
+[ -z "$NO_NVRAM" ] || PASS+=(--no-nvram)
+[ -z "$SSH_KEY" ] || PASS+=(--ssh-key "$SSH_KEY")
+PREPARE=(--phase prepare --yes --copy "$ROOT" --wifi-list "$WIFI_LIST")
+if [ "$MODE" = keep ]; then
+  PREPARE+=(--keep)
+  [ -z "$KEEP_PASSWORDS" ] || PREPARE+=(--keep-passwords)
+fi
+"$INSTALLER/bin/sixos-install" "${PASS[@]}" "${PREPARE[@]}"
 
 # ---------------------------------------------------------------------------
 step "Building the system into $MNT/nix/store"
 # ---------------------------------------------------------------------------
-# --store $MNT puts every download and build result on the new disk.  Build
-# directories and Nix's download cache go there too, not into the live USB's
-# memory.
-WORK=$MNT/nix/install-tmp
-mkdir -p "$WORK/build" "$WORK/cache"
-SYSTEM=$(TMPDIR=$WORK/build XDG_CACHE_HOME=$WORK/cache \
-  nix-build "$ROOT" -A "hosts.$HOST.configuration" --store "$MNT" --no-out-link \
-  --option max-jobs auto --option cores 0) \
-  || die "the build failed; fix the cause, then run the same command again with --resume"
-[ -n "$SYSTEM" ] || die "the build printed no store path"
+if [ -n "$SYSTEM" ]; then
+  nix --extra-experimental-features nix-command copy --no-check-sigs --to "$MNT" "$SYSTEM"
+else
+  # --store $MNT puts every download and build result on the new disk.  Build
+  # directories and Nix's download cache go there too, not into the live
+  # USB's memory.
+  WORK=$MNT/nix/install-tmp
+  mkdir -p "$WORK/build" "$WORK/cache"
+  SYSTEM=$(TMPDIR=$WORK/build XDG_CACHE_HOME=$WORK/cache \
+    nix-build "$ROOT" -A "hosts.$HOST.configuration" --store "$MNT" --no-out-link \
+    --option max-jobs auto --option cores 0) \
+    || die "the build failed (above).  Fix the cause (often the network), then run this again and reuse the disk: nothing downloaded so far is lost."
+  [ -n "$SYSTEM" ] || die "the build printed no store path"
+  rm -rf "$WORK"
+fi
 echo "system: $SYSTEM"
-rm -rf "$WORK"
 
 # ---------------------------------------------------------------------------
 step "Installing GRUB and finishing"
 # ---------------------------------------------------------------------------
-"$INSTALLER/bin/sixos-install" --phase finish \
-  --disk "$DISK" --system "$SYSTEM" --user "$USERNAME" --uid "$USER_UID" "${PASS[@]}"
+cp "$LOG" "$MNT/home/$USERNAME/sixos-install.log"
+chown "$USER_UID:$USER_UID" "$MNT/home/$USERNAME/sixos-install.log"
+"$INSTALLER/bin/sixos-install" "${PASS[@]}" --phase finish --system "$SYSTEM"
 
 step "Done"
-echo "Type \`reboot\` and remove the USB stick."
+note "Remove the USB stick and reboot (\`reboot\`)."
+if [ "$DESKTOP" = true ]; then note "Log in on ly (tty1); a text console with a root login is on tty2."; fi
+note "Your configuration is ~/sixos-laptop: change site/hosts/$HOST.nix, then"
+note "run \`sixos-rebuild switch\` (docs/configuring.md).  Wi-Fi: \`nmtui\`."
+note "The log of this install is ~/sixos-install.log."
+if [ "$MODE" = keep ]; then
+  note "The earlier system's files are still in the Nix store; once the new one"
+  note "works, \`doas nix-collect-garbage\` frees that space."
+fi

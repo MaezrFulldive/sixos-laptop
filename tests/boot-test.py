@@ -8,6 +8,7 @@ the Nix build log) and to $out/serial.log.
 import argparse
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -40,7 +41,10 @@ cmd = [
     "-device", "nvme,serial=sixostest,drive=root",
     "-device", "virtio-vga",
     "-display", "none",
-    "-nic", "none",
+    # a network card, for NetworkManager's DHCP.  (QEMU's DHCP hands out a
+    # gateway and a DNS server; the Nix build sandbox has no network, so
+    # nothing goes anywhere.)
+    "-nic", "user,model=virtio-net-pci",
     "-serial", "stdio",
     "-monitor", f"unix:{monitor_path},server=on,wait=off",
 ] + (["-enable-kvm", "-cpu", "host"] if KVM else [])
@@ -134,15 +138,16 @@ def run(command, timeout=60):
     return int(m.group(2)), m.group(1).decode(errors="replace")
 
 
-def check(command, what, timeout=60):
+def check(command, what, timeout=60, soft=False):
     code, out = run(command, timeout)
     if code != 0:
-        fail(f"{what}: `{command}` exited with {code}:\n{out}")
+        (soft_fail if soft else fail)(f"{what}: `{command}` exited with {code}:\n{out}")
+        return out
     print(f"\n### ok: {what}", flush=True)
     return out
 
 
-def wait_until(command, what, timeout):
+def wait_until(command, what, timeout, soft=False):
     deadline = time.time() + timeout * SLOW
     while True:
         code, out = run(command)
@@ -150,7 +155,8 @@ def wait_until(command, what, timeout):
             print(f"\n### ok: {what}", flush=True)
             return out
         if time.time() > deadline:
-            fail(f"{what}: `{command}` still failing after {timeout * SLOW}s:\n{out}")
+            (soft_fail if soft else fail)(f"{what}: `{command}` still failing after {timeout * SLOW}s:\n{out}")
+            return out
         time.sleep(3)
 
 
@@ -177,6 +183,8 @@ DIAGNOSTICS = [
     "tail -n 40 /var/log/syslog/current 2>/dev/null || true",
     "tail -n 20 /var/log/messages 2>/dev/null || true",
     "dmesg | tail -n 20",
+    "tail -n 30 /var/log/networkmanager/current 2>/dev/null || true",
+    "tail -n 10 /var/log/dbus/current 2>/dev/null || true",
 ]
 
 
@@ -240,7 +248,8 @@ time.sleep(2)
 login("root", args.root_password, wait_for_prompt=False)
 check("test \"$(id -u)\" = 0", "root logged in with the root password")
 
-for svc in ["seatd", "run-user", "pam-helpers", "dnscache", "ly", "earlyoom", "etc-ssl", "nix-daemon"]:
+for svc in ["seatd", "run-user", "pam-helpers", "ly", "earlyoom", "etc-ssl", "nix-daemon",
+            "dbus", "wpa-supplicant", "networkmanager", "backlight", "keyring-wrapper"]:
     wait_until(f"s6-rc -a list | grep -qx '{svc}'", f"service {svc} is up", 120)
 wait_until("pidof ly", "ly is running", 60)
 
@@ -256,6 +265,30 @@ check(f"test ! -e /home/{args.user}/sixos-laptop/result && test ! -L /home/{args
 check("grep -q ssh-ed25519 /root/.ssh/authorized_keys", "the --ssh-key was installed")
 check("ls /run/booted-system/firmware/lib/firmware/iwlwifi-*.zst | head -n 1 | grep -q zst",
       "the firmware is zstd-compressed")
+# networking: NetworkManager on the D-Bus system bus
+code, _ = run("(for i in $(seq 120); do nmcli -t -f TYPE,STATE device | grep -q '^ethernet:connected' && exit 0; sleep 1; done; exit 1)", 150)
+if code == 0:
+    print("\n### ok: NetworkManager configured the network card by DHCP", flush=True)
+else:
+    soft_fail("NetworkManager did not configure the network card by DHCP")
+    for c in ["nmcli device", "nmcli general", "ip -br link; ip -br addr", "lsmod | grep -i virtio",
+              "ls /sys/class/net", "tail -n 60 /var/log/networkmanager/current",
+              "tail -n 20 /var/log/wpa-supplicant/current", "tail -n 20 /var/log/dbus/current"]:
+        run(c, 30)
+out = check("grep -q '^nameserver 10.0.2.3' /etc/resolv.conf", "NetworkManager wrote /etc/resolv.conf", soft=True)
+if failures and "resolv.conf" in failures[-1]:
+    for c in ["ls -la /etc/resolv.conf /run/NetworkManager/; cat /run/NetworkManager/resolv.conf",
+              "nmcli device show eth0 | grep -i -E 'dns|ip4'", "NetworkManager --print-config 2>&1 | head -40",
+              "grep -i -E 'dns|resolv' /var/log/syslog/current | tail -n 20",
+              "tail -n 20 /var/log/networkmanager/current"]:
+        run(c, 30)
+check("nmcli -t -f NAME connection show | grep -qx TestNet && nmcli -t -f NAME connection show | grep -qx OldNet",
+      "NetworkManager has the installer's and the converted iwd Wi-Fi networks", soft=True)
+check(f"test \"$(cat /home/{args.user}/keep-me)\" = kept", "the reinstall kept /home", soft=True)
+check("for c in nmtui nmcli vim nano git curl w3m ssh lsblk parted htop sixos-rebuild; do command -v $c >/dev/null || exit 1; done",
+      "the rescue tools are installed", soft=True)
+check("sixos-rebuild --help | grep -q switch", "sixos-rebuild runs", soft=True)
+check("grep -qx 'source=/etc/mango/sixos.conf' /etc/mango/config.conf", "mango's config includes sixos.conf", soft=True)
 check("grep -q 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt && grep -q 'BEGIN CERTIFICATE' /etc/ssl/cert.pem",
       "/etc/ssl has the https certificates")
 check("tr '\\0' ' ' < /proc/$(pidof nix-daemon | cut -d' ' -f1)/cmdline | grep -q 'ssl-cert-file /run/current-system/etc/ssl/certs/ca-certificates.crt'",
@@ -274,6 +307,8 @@ logout()
 
 login(args.user, args.user_password)
 check("test \"$(id -un)\" = " + args.user, "user logged in with their password")
+check("nmcli -t general permissions | grep -q '^org.freedesktop.NetworkManager.network-control:yes$'",
+      "the user may change the network (nmtui) without doas", soft=True)
 check("test \"$SSL_CERT_FILE\" = /run/current-system/etc/ssl/certs/ca-certificates.crt && test \"$NIX_SSL_CERT_FILE\" = \"$SSL_CERT_FILE\"",
       "the login shell has SSL_CERT_FILE and NIX_SSL_CERT_FILE")
 # what `nix-build -A hosts.laptop.configuration` relies on: the user builds
@@ -335,8 +370,38 @@ else:
     # mango-session: D-Bus session bus and session-commands (tests/site/hosts/testvm.nix)
     check(f"test \"$(stat -c %U /proc/$(pidof dbus-daemon | cut -d' ' -f1))\" = {args.user}",
           "the session has a D-Bus session bus")
-    check(f"test \"$(stat -c %U /proc/$(pidof pipewire | cut -d' ' -f1))\" = {args.user}",
-          "session-commands started pipewire as the user")
+    for prog in ["pipewire", "wireplumber", "pipewire-pulse"]:
+        check(f"test \"$(stat -c %U /proc/$(pidof {prog} | cut -d' ' -f1))\" = {args.user}",
+              f"sound: {prog} runs as the user", soft=True)
+    check(f"for p in $(pidof sleep); do grep -q 100000 /proc/$p/cmdline && stat -c %U /proc/$p; done | grep -qx {args.user}",
+          "session-commands started as the user", soft=True)
+    check("pidof wl-paste && pidof wl-clip-persist", "mango ran the exec-once lines of sixos.conf (clipboard)", soft=True)
+
+    def as_user(cmd):
+        """cmd as the user, in the session's environment (taken from
+        wl-paste, which mango started)"""
+        return ("p=$(pidof wl-paste | cut -d' ' -f1); "
+                f"doas -u {args.user} env -i $(tr '\\0' '\\n' < /proc/$p/environ | grep -E "
+                "'^(DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XDG_DATA_DIRS|XDG_CONFIG_DIRS"
+                "|XDG_CURRENT_DESKTOP|NIX_XDG_DESKTOP_PORTAL_DIR|PATH|HOME)=') "
+                f"sh -c {shlex.quote(cmd)}")
+
+    check(as_user("echo sixos-clip | wl-copy && sleep 1 && cliphist list | grep -q sixos-clip"),
+          "the clipboard history records what is copied", soft=True)
+    check(as_user("grim /tmp/shot.png && test -s /tmp/shot.png"), "grim takes a screenshot", soft=True)
+    portal_get = ("dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop "
+                  "/org/freedesktop/portal/desktop org.freedesktop.DBus.Properties.Get "
+                  "string:org.freedesktop.portal.{} string:version | grep -q uint32")
+    check(as_user(portal_get.format("Screenshot")), "the screenshot portal works (xdg-desktop-portal-wlr)", 90, soft=True)
+    check(as_user(portal_get.format("FileChooser")), "the file chooser portal works (xdg-desktop-portal-gtk)", 90, soft=True)
+    check(as_user("dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets "
+                  "org.freedesktop.DBus.Peer.Ping >/dev/null && pidof gnome-keyring-daemon"),
+          "the keyring starts on demand", 60, soft=True)
+    code, out = run(as_user("QT_QPA_PLATFORM=offscreen timeout 120 qutebrowser --version 2>/dev/null | grep -m 1 'qutebrowser v'"), 150)
+    if code == 0 and "qutebrowser v" in out:
+        print("\n### ok: qutebrowser runs", flush=True)
+    else:
+        soft_fail("qutebrowser --version did not work")
     check("tr '\\0' '\\n' < /proc/$(pidof mango | cut -d' ' -f1)/environ | grep -qx 'XDG_DATA_DIRS=/run/current-system/sw/share'",
           "the session has XDG_DATA_DIRS")
     check("tr '\\0' '\\n' < /proc/$(pidof mango | cut -d' ' -f1)/environ | grep -qx 'SSL_CERT_FILE=/run/current-system/etc/ssl/certs/ca-certificates.crt'",

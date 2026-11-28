@@ -8,11 +8,11 @@ laptop-host args {
   username = "tester";
   root-disk-modules = [ "nvme" ];     # QEMU emulates an NVMe disk, like most laptops
   console = { device = "ttyS0"; baud = 115200; };   # serial port, read by the test
-  wifi = null;
+  desktop = true;
+  qutebrowser = true;
 
-  # sound, as docs/systemd-gaps.md describes it
-  extra-packages = pkgs: with pkgs; [ pipewire wireplumber ];
-  session-commands = [ "pipewire" "wireplumber" ];
+  # a session program of our own (sound is always started)
+  session-commands = [ "sleep 100000" ];
 
   # a service of our own (by-name/ea/earlyoom)
   extra-config = host: {

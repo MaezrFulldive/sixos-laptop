@@ -8,9 +8,8 @@ usage() {
   cat <<'EOF'
 Usage: sixos-install --disk DEV --system PATH --user NAME [options]
 
-Usually you don't run this yourself: scripts/install-over-ssh (on the build
-machine) runs it on the live USB in two phases and copies the system in
-between.
+Usually you don't run this yourself: scripts/install-on-live-usb asks the
+questions and runs it in two phases, building the system in between.
 
 Required:
   --disk DEV        the whole disk to ERASE, e.g. /dev/nvme0n1 or /dev/sda
@@ -24,16 +23,27 @@ Options:
   --uid N           your user id (default 1000, as in nix/laptop.nix)
   --ssh-key KEY     a public key (the text, or a .pub file) allowed to log
                     in as root over ssh, so you can push updates later
-  --wifi SSID       add a Wi-Fi network; asks for its passphrase
+  --wifi SSID       add a Wi-Fi network; asks for its passphrase (or takes it
+                    from $SIXOS_WIFI_PASSPHRASE; empty = an open network)
+  --wifi-list FILE  add the Wi-Fi networks in FILE: one per line,
+                    SSID<TAB>passphrase
+  --keep            reinstall over an earlier sixos install on DEV without
+                    erasing it: keep its partitions, its Nix store (so
+                    nothing is downloaded or built twice), /home and /root,
+                    its ssh host keys and Wi-Fi networks (NetworkManager's,
+                    and iwd's from older installs); everything else in / is
+                    replaced
+  --keep-passwords  with --keep: keep the passwords too, without asking
   --copy DIR        copy DIR (e.g. this repo) into the new home directory
   --esp-size SIZE   size of the EFI partition (default 1GiB)
   --yes             don't ask before erasing the disk
   --no-nvram        don't add a firmware boot entry; only install GRUB at the
                     fallback path EFI/BOOT/BOOTX64.EFI (always done anyway)
   --phase PHASE     all (default): everything, copying the system with --from
-                    prepare: ask questions, partition, mount at /mnt, write
-                             /etc; then stop, so the system can be copied into
-                             /mnt from elsewhere (--system is not needed)
+                    prepare: ask questions, partition (or with --keep, clean
+                             up), mount at /mnt, write /etc; then stop, so the
+                             system can be built or copied into /mnt
+                             (--system is not needed)
                     finish:  after the copy: boot profiles, GRUB, unmount
 
 Passwords are asked for interactively.  For unattended installs, set
@@ -46,7 +56,7 @@ die() { echo "sixos-install: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
 DISK='' SYSTEM='' USERNAME='' FROM='' USER_UID=1000 SSH_KEY='' WIFI_SSID='' COPY_DIR=''
-ESP_SIZE=1GiB ASSUME_YES='' NO_NVRAM='' PHASE=all
+ESP_SIZE=1GiB ASSUME_YES='' NO_NVRAM='' PHASE=all WIFI_LIST='' KEEP='' KEEP_PASSWORDS=
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk) DISK=$2; shift 2 ;;
@@ -56,6 +66,9 @@ while [ $# -gt 0 ]; do
     --uid) USER_UID=$2; shift 2 ;;
     --ssh-key) SSH_KEY=$2; shift 2 ;;
     --wifi) WIFI_SSID=$2; shift 2 ;;
+    --wifi-list) WIFI_LIST=$2; shift 2 ;;
+    --keep) KEEP=1; shift ;;
+    --keep-passwords) KEEP_PASSWORDS=1; shift ;;
     --copy) COPY_DIR=$2; shift 2 ;;
     --esp-size) ESP_SIZE=$2; shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
@@ -79,6 +92,7 @@ case "$SYSTEM" in
   *) die "--system must be a /nix/store/... path (run \`readlink -f result\` on the build machine)" ;;
 esac
 if [ -n "$COPY_DIR" ] && [ ! -d "$COPY_DIR" ]; then die "--copy: $COPY_DIR is not a directory"; fi
+if [ -n "$WIFI_LIST" ] && [ ! -f "$WIFI_LIST" ]; then die "--wifi-list: $WIFI_LIST does not exist"; fi
 
 # /dev/nvme0n1 -> /dev/nvme0n1p1, /dev/sda -> /dev/sda1
 case "$DISK" in
@@ -95,7 +109,17 @@ if [ "$PHASE" != finish ]; then   # (not indented, to keep the diff readable)
 # Ask everything up front, so the rest runs unattended
 # ---------------------------------------------------------------------------
 
-if [ -z "$ASSUME_YES" ]; then
+umount -R "$MNT" 2>/dev/null || true
+
+if [ -n "$KEEP" ]; then
+  [ "$(blkid -s LABEL -o value "$ROOT" 2>/dev/null)" = sixos ] \
+    || die "--keep: $ROOT is not a sixos partition (label sixos); install without --keep"
+  [ "$(blkid -s TYPE -o value "$ESP" 2>/dev/null)" = vfat ] \
+    || die "--keep: $ESP is not an EFI partition; install without --keep"
+  mkdir -p "$MNT"
+  mount "$ROOT" "$MNT"
+  [ -d "$MNT/nix/store" ] || { umount "$MNT"; die "--keep: $ROOT has no /nix/store; install without --keep"; }
+elif [ -z "$ASSUME_YES" ]; then
   echo "This ERASES EVERYTHING on $DISK:"
   lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL "$DISK" || true
   printf 'Type the disk name (%s) to continue: ' "$DISK"
@@ -103,33 +127,130 @@ if [ -z "$ASSUME_YES" ]; then
   [ "$answer" = "$DISK" ] || die "aborted"
 fi
 
+# ask_password WHO [SAME_AS_HASH]: prints a SHA-512 crypt hash.  With
+# SAME_AS_HASH, an empty answer means "the same password".
+ask_password() {
+  local pw1 pw2
+  while true; do
+    read -r -s -p "  password: " pw1 </dev/tty; echo >&2
+    if [ -z "$pw1" ] && [ -n "${2:-}" ]; then echo "$2"; return; fi
+    [ -n "$pw1" ] || { echo "  (empty; try again)" >&2; continue; }
+    read -r -s -p "  again:    " pw2 </dev/tty; echo >&2
+    [ "$pw1" = "$pw2" ] && break
+    echo "  they don't match; try again" >&2
+  done
+  printf '%s' "$pw1" | openssl passwd -6 -stdin
+}
+
 ROOT_HASH=${SIXOS_ROOT_PASSWORD_HASH:-}
 USER_HASH=${SIXOS_USER_PASSWORD_HASH:-}
-if [ -z "$ROOT_HASH" ]; then
-  echo "Choose the ROOT password (for the rescue login on tty2):"
-  ROOT_HASH=$(openssl passwd -6) || die "passwords did not match"
-fi
-if [ -z "$USER_HASH" ]; then
-  echo "Choose the password for $USERNAME (for ly and doas):"
-  USER_HASH=$(openssl passwd -6) || die "passwords did not match"
+
+# --keep: the old install's passwords, if it has them
+if [ -n "$KEEP" ] && [ -f "$MNT/etc/shadow" ] && { [ -z "$ROOT_HASH" ] || [ -z "$USER_HASH" ]; }; then
+  OLD_ROOT_HASH=$(awk -F: '$1 == "root" { print $2 }' "$MNT/etc/shadow")
+  OLD_USER_HASH=$(awk -F: -v u="$USERNAME" '$1 == u { print $2 }' "$MNT/etc/shadow")
+  if [ -n "$OLD_ROOT_HASH" ] && [ -n "$OLD_USER_HASH" ]; then
+    answer=y
+    if [ -z "$KEEP_PASSWORDS" ]; then
+      read -r -p "Keep the passwords of root and $USERNAME from the earlier install? [Y/n] " answer </dev/tty
+    fi
+    case "$answer" in
+      ''|[Yy]*)
+        ROOT_HASH=${ROOT_HASH:-$OLD_ROOT_HASH}
+        USER_HASH=${USER_HASH:-$OLD_USER_HASH} ;;
+    esac
+  fi
 fi
 
-WIFI_PASS=
-if [ -n "$WIFI_SSID" ]; then
-  printf 'Wi-Fi passphrase for %s: ' "$WIFI_SSID"
-  stty -echo 2>/dev/null || true
-  read -r WIFI_PASS
-  stty echo 2>/dev/null || true
+if [ -z "$USER_HASH" ]; then
+  echo "Choose the password for $USERNAME (for ly and doas):"
+  USER_HASH=$(ask_password) || die "could not set the password"
+fi
+if [ -z "$ROOT_HASH" ]; then
+  echo "Choose the ROOT password, for the rescue login on the console (Enter: the same as $USERNAME's):"
+  ROOT_HASH=$(ask_password "$USER_HASH") || die "could not set the password"
+fi
+
+WIFI_PASS=${SIXOS_WIFI_PASSPHRASE:-}
+if [ -n "$WIFI_SSID" ] && [ -z "${SIXOS_WIFI_PASSPHRASE+set}" ]; then
+  read -r -s -p "Wi-Fi passphrase for $WIFI_SSID (Enter: an open network): " WIFI_PASS </dev/tty
   echo
 fi
 
+# nm_wifi DIR SSID PASSPHRASE: a NetworkManager connection file for a WPA
+# (or, without a passphrase, an open) Wi-Fi network
+nm_wifi() {
+  local dir=$1 ssid=$2 pass=$3 esc_ssid esc_pass
+  esc_ssid=$(printf '%s' "$ssid" | sed 's/\\/\\\\/g')
+  esc_pass=$(printf '%s' "$pass" | sed 's/\\/\\\\/g')
+  install -d -m 0700 "$dir"
+  (
+    umask 077
+    printf '[connection]\nid=%s\nuuid=%s\ntype=wifi\n\n[wifi]\nmode=infrastructure\nssid=%s\n\n' \
+      "$esc_ssid" "$(cat /proc/sys/kernel/random/uuid)" "$esc_ssid"
+    if [ -n "$pass" ]; then
+      printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$esc_pass"
+    fi
+    printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+  ) > "$dir/$(printf '%s' "$ssid" | tr -c 'A-Za-z0-9._-' '_').nmconnection"
+}
+
+# iwd_to_nm DIR PSKFILE: convert an iwd network file (what installs before
+# NetworkManager used) to a NetworkManager connection
+iwd_to_nm() {
+  local name ssid pass
+  name=$(basename "$2" .psk)
+  case "$name" in
+    =*) ssid=$(printf '%b' "$(printf '%s' "${name#=}" | sed 's/../\\x&/g')") ;;  # hex-encoded name
+    *) ssid=$name ;;
+  esac
+  pass=$(sed -n 's/^Passphrase=//p' "$2" | head -n 1)
+  [ -n "$pass" ] || pass=$(sed -n 's/^PreSharedKey=//p' "$2" | head -n 1)
+  nm_wifi "$1" "$ssid" "$pass"
+}
+
 set -x
 
+if [ -n "$KEEP" ]; then
+# ---------------------------------------------------------------------------
+step "Reusing the earlier install on $ROOT"
+# ---------------------------------------------------------------------------
+
+# Keep: nix (the store and its database), home, root, lost+found.  Set aside
+# first: ssh host keys, the machine id, Wi-Fi networks.
+KEEPDIR=$MNT/.sixos-install-keep
+rm -rf "$KEEPDIR"
+mkdir -m 0700 "$KEEPDIR"
+mkdir -m 0700 "$KEEPDIR/nm"
+cp -a "$MNT"/etc/ssh/ssh_host_* "$KEEPDIR/" 2>/dev/null || true
+cp -a "$MNT/etc/machine-id" "$KEEPDIR/" 2>/dev/null || true
+cp -a "$MNT"/etc/NetworkManager/system-connections/. "$KEEPDIR/nm/" 2>/dev/null || true
+set +x   # (passphrases)
+for f in "$MNT"/etc/iwd/networks/*.psk; do
+  [ -e "$f" ] || continue
+  echo "converting the Wi-Fi network $(basename "$f" .psk) from iwd"
+  iwd_to_nm "$KEEPDIR/nm" "$f"
+done
+set -x
+for f in "$MNT"/* "$MNT"/.[!.]*; do
+  case "${f#"$MNT"/}" in
+    nix|home|root|lost+found|.sixos-install-keep|'.[!.]*') ;;
+    *) rm -rf "$f" ;;
+  esac
+done
+# the old system's boot profiles (its store paths stay until garbage
+# collection), and leftovers of an interrupted build
+rm -rf "$MNT/nix/var/nix/profiles" "$MNT/nix/install-tmp"
+
+mkfs.fat -F 32 -n ESP "$ESP"
+mkdir -p "$MNT/boot"
+mount "$ESP" "$MNT/boot"
+
+else
 # ---------------------------------------------------------------------------
 step "Partitioning $DISK"
 # ---------------------------------------------------------------------------
 
-umount -R "$MNT" 2>/dev/null || true
 wipefs -a "$DISK"
 parted -s "$DISK" -- \
   mklabel gpt \
@@ -147,6 +268,7 @@ mkdir -p "$MNT"
 mount "$ROOT" "$MNT"
 mkdir -p "$MNT/boot"
 mount "$ESP" "$MNT/boot"
+fi
 
 # ---------------------------------------------------------------------------
 step "Directories, passwords and /etc"
@@ -157,6 +279,10 @@ install -d -m 0700 "$MNT/root"
 install -d -m 1777 "$MNT/tmp"
 install -d -m 0755 "$MNT/home"
 install -d -m 0700 -o "$USER_UID" -g "$USER_UID" "$MNT/home/$USERNAME"
+if [ -n "$KEEP" ]; then
+  cp -a "$KEEPDIR"/ssh_host_* "$MNT/etc/ssh/" 2>/dev/null || true
+  cp -a "$KEEPDIR/machine-id" "$MNT/etc/" 2>/dev/null || true
+fi
 
 # Password hashes live only here, never in the Nix store.  SHA-512 ($6$)
 # because busybox `login` doesn't understand yescrypt.
@@ -182,40 +308,52 @@ done
   echo console
 } > "$MNT/etc/securetty"
 
-echo 'nameserver 127.0.0.1' > "$MNT/etc/resolv.conf"   # the local dnscache
+# (/etc/resolv.conf is written by NetworkManager)
 
-# sshd host keys (sshd runs by default; password logins are disabled)
+# sshd host keys, for `sshd = true` (only the missing ones are made)
 ssh-keygen -A -f "$MNT"
 if [ -n "$SSH_KEY" ]; then
   install -d -m 0700 "$MNT/root/.ssh"
-  if [ -f "$SSH_KEY" ]; then cat "$SSH_KEY"; else echo "$SSH_KEY"; fi \
-    >> "$MNT/root/.ssh/authorized_keys"
+  key=$(if [ -f "$SSH_KEY" ]; then cat "$SSH_KEY"; else echo "$SSH_KEY"; fi)
+  grep -qxF "$key" "$MNT/root/.ssh/authorized_keys" 2>/dev/null \
+    || echo "$key" >> "$MNT/root/.ssh/authorized_keys"
   chmod 600 "$MNT/root/.ssh/authorized_keys"
 fi
 
-# Wi-Fi (eiwd: iwd without D-Bus, configured only through files)
-install -d -m 0700 "$MNT/etc/iwd" "$MNT/etc/iwd/networks"
-cat > "$MNT/etc/iwd/main.conf" <<'EOF'
-[General]
-EnableNetworkConfiguration=true
-
-[Network]
-NameResolvingService=none
-EOF
-if [ -n "$WIFI_SSID" ]; then
-  set +x
-  (
-    umask 077
-    printf '[Security]\nPassphrase=%s\n' "$WIFI_PASS" > "$MNT/etc/iwd/networks/$WIFI_SSID.psk"
-  )
-  set -x
+# Wi-Fi networks, for NetworkManager
+NM_DIR=$MNT/etc/NetworkManager/system-connections
+install -d -m 0755 "$MNT/etc/NetworkManager"
+install -d -m 0700 "$NM_DIR"
+set +x   # (passphrases)
+if [ -n "$KEEP" ]; then
+  cp -a "$KEEPDIR"/nm/. "$NM_DIR/" 2>/dev/null || true
+  rm -rf "$KEEPDIR"
 fi
+if [ -n "$WIFI_SSID" ]; then
+  nm_wifi "$NM_DIR" "$WIFI_SSID" "$WIFI_PASS"
+fi
+if [ -n "$WIFI_LIST" ]; then
+  while IFS=$'\t' read -r ssid pass; do
+    [ -n "$ssid" ] && nm_wifi "$NM_DIR" "$ssid" "$pass"
+  done < "$WIFI_LIST"
+fi
+chown -R 0:0 "$NM_DIR"
+chmod 600 "$NM_DIR"/* 2>/dev/null || true
+echo "Wi-Fi networks:" "$NM_DIR"/*.nmconnection
+set -x
 
 if [ -n "$COPY_DIR" ]; then
-  cp -a "$COPY_DIR" "$MNT/home/$USERNAME/"
-  rm -f "$MNT/home/$USERNAME/$(basename "$COPY_DIR")"/result*
-  chown -R "$USER_UID:$USER_UID" "$MNT/home/$USERNAME"
+  dest=$MNT/home/$USERNAME/$(basename "$COPY_DIR")
+  if [ -e "$dest" ]; then   # --keep: an older copy
+    old=$dest.old-$(date +%Y%m%d-%H%M%S)
+    echo "moving the existing $(basename "$dest") aside to $(basename "$old")"
+    mv "$dest" "$old"
+  fi
+  cp -a "$COPY_DIR" "$dest"
+  rm -f "$dest"/result*
+  chown -R "$USER_UID:$USER_UID" "$dest"
 fi
+chown "$USER_UID:$USER_UID" "$MNT/home/$USERNAME"
 
 fi  # end of the prepare part
 

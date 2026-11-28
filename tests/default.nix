@@ -2,20 +2,28 @@
 #
 #   nix-build tests -A all
 #
-# 1. `install`: runs scripts/install-over-ssh (the command README.md tells
-#    you to run, which runs installer/sixos-install.sh on the laptop) inside a
-#    throwaway VM, onto an empty virtual disk.  `ssh` is replaced by a stand-in
-#    that runs the "laptop" side in the same VM, so everything else is real:
-#    the Nix ssh copies, both installer phases and the repository copy.
-# 2. `boot`: boots that disk in QEMU with UEFI firmware and an NVMe drive, like
-#    a laptop, and checks over the serial console that:
+# 1. `install`: runs scripts/install-on-live-usb (the command README.md tells
+#    you to run on the live USB) inside a throwaway VM, twice:
+#      a. onto an empty virtual disk, answering every question with flags:
+#         it erases the disk, writes a host file, adds a Wi-Fi network
+#      b. again onto the same disk, reusing it (--keep), after adding a file
+#         to /home and an old-style iwd Wi-Fi network: these must survive,
+#         the iwd network must become a NetworkManager one, and the
+#         passwords must be kept
+#    The system is the prebuilt test system (building it needs the
+#    network), so only the build step itself is skipped.
+# 2. `boot`: boots that disk in QEMU with UEFI firmware, an NVMe drive and a
+#    network card, like a laptop, and checks over the serial console that
 #      - GRUB, the kernel, the initrd and s6 come up and print `login:`
 #      - root and the user can log in with their passwords (/etc/shadow)
 #      - doas asks for a password, accepts the right one, rejects a wrong one
-#      - ly, seatd, run-user and dnscache are running
-#      - logging in through ly (typed on the virtual keyboard) starts mango
+#      - the services are up; NetworkManager configures the network card
+#        by DHCP and knows both Wi-Fi networks
+#      - logging in through ly (typed on the virtual keyboard) starts mango,
+#        with sound, portals, the keyring, the clipboard history ...
 #      - poweroff powers the machine off (rather than rebooting it)
 #    It saves the serial log and a screenshot in its output.
+# 3. `generated-host`: the host file the installer wrote in 1a evaluates.
 #
 # The test machine is tests/site/hosts/testvm.nix: nix/laptop.nix with
 # settings for the virtual hardware.
@@ -44,25 +52,11 @@ let
     ];
   };
 
-  # Stands in for ssh: skips the options and the host name, then runs the
-  # command with bash, like the live USB's root shell would.
-  fake-ssh = pkgs.writeShellScriptBin "ssh" ''
-    host=
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --) shift; break ;;
-        -[bcDEeFIiJLlmOopQRSWw]) shift 2 ;;   # options that take an argument
-        -*) shift ;;
-        *) if [ -z "$host" ]; then host=$1; shift; else break; fi ;;
-      esac
-    done
-    [ $# -gt 0 ] || exit 0    # e.g. `ssh -O exit host`
-    echo "(fake ssh to $host) $*" >&2
-    exec ${pkgs.bash}/bin/bash -c "$*"
-  '';
-
   install = vmTools.runInLinuxVM (pkgs.runCommand "sixos-test-install" {
-    nativeBuildInputs = [ fake-ssh pkgs.nix pkgs.openssl pkgs.bash pkgs.gnutar ];
+    # what the NixOS live USB has
+    nativeBuildInputs = with pkgs; [
+      nix openssl bash gnutar util-linux gawk gnused gnugrep coreutils findutils
+    ];
     closure = pkgs.closureInfo { rootPaths = [ system repo.installer ]; };
     memSize = 2048;
     preVM = ''
@@ -71,31 +65,72 @@ let
       ${pkgs.qemu_kvm}/bin/qemu-img create -f qcow2 $diskImage 16G
     '';
   } ''
+    set -euxo pipefail
     # A Nix database for the store paths the VM can see, so that the
     # installer's `nix copy` works (the same trick nixpkgs' make-disk-image uses)
     export HOME=$TMPDIR
     export NIX_STATE_DIR=$TMPDIR/state
     nix-store --load-db < $closure/registration
-
-    export SIXOS_ROOT_PASSWORD_HASH=$(openssl passwd -6 -salt sixostest ${root-password})
-    export SIXOS_USER_PASSWORD_HASH=$(openssl passwd -6 -salt sixostest ${user-password})
-
-    # nothing to download from in the sandbox
-    export NIX_CONFIG="substituters ="
+    export NIX_CONFIG="substituters ="   # nothing to download from in the sandbox
 
     # a stand-in for the repository, with a result link that must not be copied
-    mkdir -p $TMPDIR/sixos-laptop/scripts
-    cp ${../scripts/install-over-ssh} $TMPDIR/sixos-laptop/scripts/install-over-ssh
-    cp ${../pins.json} $TMPDIR/sixos-laptop/pins.json
-    ln -s /nix/store/does-not-exist $TMPDIR/sixos-laptop/result
-
+    R=$TMPDIR/sixos-laptop
+    mkdir -p $R/scripts $R/site/hosts
+    cp ${../scripts/install-on-live-usb} $R/scripts/install-on-live-usb
+    cp ${../pins.json} $R/pins.json
+    cp ${./site/hosts/testvm.nix} $R/site/hosts/testvm.nix
+    ln -s /nix/store/does-not-exist $R/result
     echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDummyKeyForTheAutomatedTestOnly test" > $TMPDIR/key.pub
+    common="--yes --disk /dev/vda --no-nvram --installer ${repo.installer} --system ${system}"
 
-    bash $TMPDIR/sixos-laptop/scripts/install-over-ssh fakehost \
-      --disk /dev/vda --user ${username} --ssh-key $TMPDIR/key.pub \
-      --system ${system} --installer ${repo.installer} \
-      --yes --no-nvram
+    # a. a new install
+    SIXOS_ROOT_PASSWORD_HASH=$(openssl passwd -6 -salt sixostest ${root-password}) \
+    SIXOS_USER_PASSWORD_HASH=$(openssl passwd -6 -salt sixostest ${user-password}) \
+    SIXOS_WIFI_PASSPHRASE=test-passphrase \
+      bash $R/scripts/install-on-live-usb $common --erase \
+        --host gen --user ${username} --desktop --qutebrowser \
+        --wifi TestNet --ssh-key $TMPDIR/key.pub
+    cp $R/site/hosts/gen.nix $out/gen.nix
+
+    # what an older install would have left behind
+    mount /dev/vda2 /mnt
+    echo kept > /mnt/home/${username}/keep-me
+    mkdir -p /mnt/etc/iwd/networks
+    printf '[Security]\nPassphrase=old-passphrase\n' > /mnt/etc/iwd/networks/OldNet.psk
+    umount /mnt
+
+    # b. reinstall, reusing the disk (no password hashes given: they must
+    # come from the first install)
+    bash $R/scripts/install-on-live-usb $common --keep --keep-passwords \
+      --host testvm --use-host-file --no-wifi
+
+    # the reused disk
+    mount /dev/vda2 /mnt
+    test "$(cat /mnt/home/${username}/keep-me)" = kept
+    test ! -e /mnt/etc/iwd
+    grep -q '^psk=old-passphrase$' /mnt/etc/NetworkManager/system-connections/OldNet.nmconnection
+    grep -q '^psk=test-passphrase$' /mnt/etc/NetworkManager/system-connections/TestNet.nmconnection
+    ls -d /mnt/home/${username}/sixos-laptop.old-*
+    umount /mnt
+    echo "### ok: the reinstall kept /home and the Wi-Fi networks"
   '');
+
+  # The host file the installer wrote must evaluate.  (Evaluating it means
+  # reading the install's output, i.e. import-from-derivation.)
+  generated-site = pkgs.runCommand "sixos-test-generated-site" { } ''
+    cp -r ${./site} $out
+    chmod -R u+w $out
+    rm $out/hosts/*
+    cp ${install}/gen.nix $out/hosts/gen.nix
+  '';
+  # sixos reads a site only from a path value; reading a file from the
+  # build output first makes Nix build it (import-from-derivation)
+  generated-site-path = builtins.seq
+    (builtins.readFile "${generated-site}/hosts/gen.nix")
+    (/. + builtins.unsafeDiscardStringContext "${generated-site}");
+  generated-host = pkgs.writeText "sixos-test-generated-host-evaluates"
+    (builtins.unsafeDiscardOutputDependency
+      (import ../. { site-dir = generated-site-path; }).hosts.gen.configuration.drvPath);
 
   boot = pkgs.runCommand "sixos-test-boot" {
     nativeBuildInputs = [ pkgs.qemu_kvm pkgs.python3 ];
@@ -117,13 +152,14 @@ let
 
 in
 {
-  inherit install boot system;
+  inherit install boot system generated-host;
 
   # the real laptop configuration must evaluate and build too
   laptop = (import ../. { }).hosts.laptop.configuration;
 
   all = pkgs.linkFarm "sixos-laptop-tests" {
     boot = boot;
+    generated-host = generated-host;
     laptop = (import ../. { }).hosts.laptop.configuration;
   };
 }

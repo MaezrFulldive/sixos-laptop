@@ -56,4 +56,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck the install scripts
-        run: shellcheck --shell=bash installer/sixos-install.sh scripts/install-over-ssh scripts/install-on-live-usb
+        run: shellcheck --shell=bash installer/sixos-install.sh scripts/install-on-live-usb
