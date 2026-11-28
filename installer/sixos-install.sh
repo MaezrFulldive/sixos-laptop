@@ -295,7 +295,7 @@ set -x
 chmod 600 "$MNT/etc/shadow"
 
 # /etc entries that follow the running configuration (and so every update)
-for d in pam.d mango fonts ssl; do
+for d in pam.d mango fonts ssl nix; do
   ln -sfn "/run/current-system/etc/$d" "$MNT/etc/$d"
 done
 

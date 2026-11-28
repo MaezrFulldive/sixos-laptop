@@ -227,6 +227,12 @@ infuse host-prev ([{
       export NIX_SSL_CERT_FILE=${ca-file}
       export EDITOR=vim PAGER=less
     '';
+    # for Nix run as root (deploy, nextboot): sixos's build group is
+    # _nixbld, not Nix's default `nixbld`
+    "etc/nix/nix.conf" = pkgs.writeText "nix.conf" ''
+      build-users-group = _nixbld
+      ssl-cert-file = ${ca-file}
+    '';
     "etc/ssl/certs/ca-certificates.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     "etc/ssl/certs/ca-bundle.crt" = "${desktop-pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     # where nixpkgs' git/curl look when SSL_CERT_FILE isn't set (e.g. with doas)
@@ -343,16 +349,33 @@ infuse host-prev ([{
 
   # /etc/ssl -> /run/current-system/etc/ssl, for programs that look for
   # certificates there rather than in $SSL_CERT_FILE (e.g. anything run with
-  # doas, which clears the environment).  Systems installed before this
-  # existed get the link on their next boot.
+  # doas, which clears the environment), and /etc/nix (nix.conf, above).
+  # Systems installed before these existed get the links when this starts
+  # (at boot, or when `deploy` switches to a system that has it).
   targets.etc-ssl.__assign = host-final.six.mkOneshot {
     up = pkgs.writeScript "etc-ssl-up" ''
       #!${pkgs.runtimeShell}
-      if [ ! -e /etc/ssl ] && [ ! -L /etc/ssl ]; then
-        ${pkgs.busybox}/bin/ln -s /run/current-system/etc/ssl /etc/ssl || true
-      fi
+      for d in ssl nix; do
+        if [ ! -e /etc/$d ] && [ ! -L /etc/$d ]; then
+          ${pkgs.busybox}/bin/ln -s /run/current-system/etc/$d /etc/$d || true
+        fi
+      done
+      true
     '';
     passthru.after = [ host-final.targets.mounts."" ];
+  };
+
+  # `nextboot` mounts the EFI partition (FAT) with busybox mount, which only
+  # tries the filesystems the kernel has loaded; nothing loads FAT before
+  # that, so the mount fails with "Invalid argument".  Load it at boot.
+  targets.esp-modules.__assign = host-final.six.mkOneshot {
+    up = pkgs.writeScript "esp-modules-up" ''
+      #!${pkgs.runtimeShell}
+      for m in vfat nls_cp437 nls_iso8859_1; do
+        /run/current-system/boot/modprobe-wrapped $m || true
+      done
+      true
+    '';
   };
 
   # The nix-daemon does the downloading for `nix-build` run as a user; it is

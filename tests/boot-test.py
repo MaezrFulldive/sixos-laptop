@@ -249,7 +249,8 @@ login("root", args.root_password, wait_for_prompt=False)
 check("test \"$(id -u)\" = 0", "root logged in with the root password")
 
 for svc in ["seatd", "run-user", "pam-helpers", "ly", "earlyoom", "etc-ssl", "nix-daemon",
-            "dbus", "wpa-supplicant", "networkmanager", "backlight", "keyring-wrapper"]:
+            "dbus", "wpa-supplicant", "networkmanager", "backlight", "keyring-wrapper",
+            "esp-modules"]:
     wait_until(f"s6-rc -a list | grep -qx '{svc}'", f"service {svc} is up", 120)
 wait_until("pidof ly", "ly is running", 60)
 
@@ -294,9 +295,18 @@ check("grep -q 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt && grep -q
 check("tr '\\0' ' ' < /proc/$(pidof nix-daemon | cut -d' ' -f1)/cmdline | grep -q 'ssl-cert-file /run/current-system/etc/ssl/certs/ca-certificates.crt'",
       "the nix-daemon knows where the certificates are")
 # a system installed before /etc/ssl existed gets it from the etc-ssl target
-run("rm /etc/ssl && s6-rc -d change etc-ssl && s6-rc -u change etc-ssl", 30)
-check("test \"$(readlink /etc/ssl)\" = /run/current-system/etc/ssl",
-      "the etc-ssl target creates a missing /etc/ssl")
+run("rm /etc/ssl /etc/nix && s6-rc -d change etc-ssl && s6-rc -u change etc-ssl", 30)
+check("test \"$(readlink /etc/ssl)\" = /run/current-system/etc/ssl && test \"$(readlink /etc/nix)\" = /run/current-system/etc/nix",
+      "the etc-ssl target creates a missing /etc/ssl and /etc/nix")
+# what `sixos-rebuild switch` runs after building: activate + nextboot (Nix
+# as root, mounting the EFI partition), here with the running system
+code, out = run("(timeout 240 /run/current-system/bin/deploy >/tmp/deploy.log 2>&1; e=$?; tail -n 25 /tmp/deploy.log; exit $e)", 300)
+if code != 0:
+    soft_fail(f"deploy (sixos-rebuild switch) failed:\n{out}")
+else:
+    print("\n### ok: deploy (what sixos-rebuild switch runs) works", flush=True)
+check("test \"$(readlink -f /nix/var/nix/profiles/nextboot)\" = \"$(readlink -f /run/current-system)\" && ! grep -q update-bootloader-mountpoint /proc/mounts",
+      "deploy set the boot profile and unmounted the EFI partition", soft=True)
 for c in DIAGNOSTICS:     # recorded in the log, useful when a later step fails
     run(c, 30)
 logout()
